@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Live Edge - Data Hub</title>
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#131722" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <style>
+      html, body, #root { height: 100%; margin: 0; }
+      body { font-family: system-ui, sans-serif; background: #131722; color: #d1d4dc; }
+      #root { display: flex; }
+
+      /* When installed with window-controls-overlay, the app fills the whole
+         window including the title-bar strip. Reserve just the area occupied
+         by the OS window buttons so the toolbar doesn't sit under them. */
+      @media (display-mode: window-controls-overlay) {
+        #root {
+          /* env() falls back to 0 on the browser; real values when installed */
+          padding-top: env(titlebar-area-height, 0);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

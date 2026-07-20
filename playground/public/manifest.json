@@ -1,0 +1,20 @@
+{
+  "name": "Live Edge - Data Hub",
+  "short_name": "Live Edge",
+  "description": "Charting playground with custom drawing-tool plugins",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay"],
+  "background_color": "#131722",
+  "theme_color": "#131722",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
