@@ -29,11 +29,15 @@ interface ViewPoint {
 // Which endpoint: 0 = none, 1 = p1, 2 = p2.
 type Endpoint = 0 | 1 | 2;
 
+// A "segment" stops at p2; a "ray" continues past p2 to infinity.
+export type LineKind = "segment" | "ray";
+
 export interface TrendLineOptions {
 	lineColor: string;
 	previewColor: string;
 	width: number;
 	handleRadius: number; // CSS px
+	kind: LineKind;
 }
 
 const defaultOptions: TrendLineOptions = {
@@ -41,11 +45,38 @@ const defaultOptions: TrendLineOptions = {
 	previewColor: "rgba(41, 98, 255, 0.5)",
 	width: 2,
 	handleRadius: 5,
+	kind: "segment",
 };
 
 // CSS px — how close the pointer must be to grab draggable element
 const HIT_RADIUS = 9;
 const BODY_HIT_RADIUS = 6;
+
+// Given the ray p1→p2, return the point where it exits the [0,w]×[0,h] canvas
+// rect (in the direction beyond p2). Used to draw a ray as if it reaches
+// infinity. Returns p2 unchanged if p1 and p2 coincide.
+function extendToEdge(
+	x1: number,
+	y1: number,
+	x2: number,
+	y2: number,
+	w: number,
+	h: number,
+): [number, number] {
+	const dx = x2 - x1;
+	const dy = y2 - y1;
+	if (dx === 0 && dy === 0) return [x2, y2];
+
+	// Largest t >= 0 such that (x1 + t*dx, y1 + t*dy) stays within the rect.
+	// t = 1 is exactly p2, so the clip edge is always at t >= 1.
+	let t = Infinity;
+	if (dx > 0) t = Math.min(t, (w - x1) / dx);
+	else if (dx < 0) t = Math.min(t, (0 - x1) / dx);
+	if (dy > 0) t = Math.min(t, (h - y1) / dy);
+	else if (dy < 0) t = Math.min(t, (0 - y1) / dy);
+
+	return [x1 + t * dx, y1 + t * dy];
+}
 
 // ── Renderer: pure canvas, pixels only ───────────────────────────────────────
 class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
@@ -57,6 +88,7 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 		private _handleRadius: number,
 		private _hovered: Endpoint,
 		private _showHandles: boolean,
+		private _kind: LineKind,
 	) {}
 
 	draw(target: CanvasRenderingTarget2D) {
@@ -79,17 +111,32 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 				const x2 = this._p2.x * hr;
 				const y2 = this._p2.y * vr;
 
+				// For a ray, extend the far end (p2) to the canvas edge so it
+				// reads as continuing to infinity. A segment just stops at p2.
+				let ex = x2;
+				let ey = y2;
+				if (this._kind === "ray") {
+					[ex, ey] = extendToEdge(
+						x1,
+						y1,
+						x2,
+						y2,
+						scope.bitmapSize.width,
+						scope.bitmapSize.height,
+					);
+				}
+
 				// The line
 				ctx.lineWidth = this._width;
 				ctx.strokeStyle = this._color;
 				ctx.beginPath();
 				ctx.moveTo(x1, y1);
-				ctx.lineTo(x2, y2);
+				ctx.lineTo(ex, ey);
 				ctx.stroke();
 
 				if (!this._showHandles) return;
 
-				// Endpoint handles
+				// Endpoint handles (always at the real endpoints, not the extension)
 				this._drawHandle(ctx, x1, y1, hr, this._hovered === 1);
 				this._drawHandle(ctx, x2, y2, hr, this._hovered === 2);
 			},
@@ -135,6 +182,7 @@ class TrendLinePaneView implements IPrimitivePaneView {
 			this._source._options.handleRadius,
 			this._source.hoveredHandle,
 			this._source.showHandles,
+			this._source._options.kind,
 		);
 	}
 }
@@ -212,9 +260,12 @@ export class TrendLine implements ISeriesPrimitive<Time> {
 		const dx = b.x - a.x,
 			dy = b.y - a.y;
 		const lenSq = dx * dx + dy * dy;
-		// project the point onto the segment, clamped to [0, 1]
+		// Project the point onto the line. Clamp the lower bound to p1 (t=0)
+		// always; clamp the upper bound to p2 (t=1) only for a segment. A ray
+		// extends past p2, so allow t > 1.
 		let t = lenSq === 0 ? 0 : ((x - a.x) * dx + (y - a.y) * dy) / lenSq;
-		t = Math.max(0, Math.min(1, t));
+		t = Math.max(0, t);
+		if (this._options.kind === "segment") t = Math.min(1, t);
 		const cx = a.x + t * dx,
 			cy = a.y + t * dy;
 		return Math.hypot(x - cx, y - cy) <= BODY_HIT_RADIUS;
@@ -249,7 +300,8 @@ export class TrendLineDrawingTool {
 	private _preview: PreviewTrendLine | undefined;
 	private _points: Point[] = [];
 	private _drawing = false;
-	private _onStateChange?: (drawing: boolean) => void;
+	private _activeKind: LineKind = "segment";
+	private _onStateChange?: (drawing: boolean, kind: LineKind | null) => void;
 
 	// Drag state
 	private _dragTarget:
@@ -273,7 +325,7 @@ export class TrendLineDrawingTool {
 
 	private _moveHandler = (param: MouseEventParams) => this._onDrawMove(param);
 
-	onStateChange(cb: (drawing: boolean) => void) {
+	onStateChange(cb: (drawing: boolean, kind: LineKind | null) => void) {
 		this._onStateChange = cb;
 	}
 
@@ -281,15 +333,27 @@ export class TrendLineDrawingTool {
 		return this._drawing;
 	}
 
-	toggle() {
-		this._drawing ? this.stopDrawing() : this.startDrawing();
+	// The kind currently being drawn, or null if not drawing.
+	activeKind(): LineKind | null {
+		return this._drawing ? this._activeKind : null;
 	}
 
-	startDrawing() {
+	// Toggle drawing. If already drawing a different kind, switch to the new
+	// kind instead of stopping (matches how a toolbar re-click behaves).
+	toggle(kind: LineKind = "segment") {
+		if (this._drawing && this._activeKind === kind) {
+			this.stopDrawing();
+		} else {
+			this.startDrawing(kind);
+		}
+	}
+
+	startDrawing(kind: LineKind = "segment") {
+		this._activeKind = kind;
 		this._drawing = true;
 		this._points = [];
 		this._el.style.cursor = "crosshair";
-		this._onStateChange?.(true);
+		this._onStateChange?.(true, this._activeKind);
 	}
 
 	stopDrawing() {
@@ -297,7 +361,7 @@ export class TrendLineDrawingTool {
 		this._points = [];
 		this._removePreview();
 		this._el.style.cursor = "";
-		this._onStateChange?.(false);
+		this._onStateChange?.(false, null);
 	}
 
 	remove() {
@@ -459,16 +523,13 @@ export class TrendLineDrawingTool {
 
 	private _addPoint(p: Point) {
 		this._points.push(p);
+		const options = { ...this._options, kind: this._activeKind };
 		if (this._points.length === 1) {
-			this._preview = new PreviewTrendLine(p, p, this._options);
+			this._preview = new PreviewTrendLine(p, p, options);
 			this._series.attachPrimitive(this._preview);
 		} else if (this._points.length >= 2) {
 			this._removePreview();
-			const line = new TrendLine(
-				this._points[0],
-				this._points[1],
-				this._options,
-			);
+			const line = new TrendLine(this._points[0], this._points[1], options);
 			this._lines.push(line);
 			this._series.attachPrimitive(line);
 			this.stopDrawing();

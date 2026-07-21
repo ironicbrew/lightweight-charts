@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 
+export type LineKind = 'segment' | 'ray';
+
 interface DrawingToolbarProps {
-	active: boolean;
-	onToggle: () => void;
+	activeKind: LineKind | null;
+	onToggle: (kind: LineKind) => void;
 	live: boolean;
 	onToggleLive: () => void;
 	candles: boolean;
@@ -15,6 +17,18 @@ const TrendIcon = () => (
 		<g fill="currentColor" fillRule="nonzero">
 			<path d="M7.354 21.354l14-14-.707-.707-14 14z" />
 			<path d="M22.5 7c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5zM5.5 24c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
+// Ray glyph: two ringed endpoints with the line continuing past the second,
+// trailing off toward the corner — signalling extension to infinity.
+const RayIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			<path d="M8.354 20.354l5-5-.707-.707-5 5z" />
+			<path d="M16.354 12.354l8-8-.707-.707-8 8z" />
+			<path d="M14.5 15c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5zM6.5 23c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
 		</g>
 	</svg>
 );
@@ -38,8 +52,13 @@ const ArrowIcon = () => (
 	</svg>
 );
 
+const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
+	{ kind: 'segment', label: 'Trend Line', Icon: TrendIcon },
+	{ kind: 'ray', label: 'Ray', Icon: RayIcon },
+];
+
 export function DrawingToolbar({
-	active,
+	activeKind,
 	onToggle,
 	live,
 	onToggleLive,
@@ -48,7 +67,13 @@ export function DrawingToolbar({
 }: DrawingToolbarProps) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
+	// The tool shown on the main button. Defaults to the trend line, then
+	// tracks whatever was last picked from the flyout (TradingView behaviour).
+	const [selectedKind, setSelectedKind] = useState<LineKind>('segment');
 	const rootRef = useRef<HTMLDivElement>(null);
+
+	const active = activeKind !== null;
+	const selected = TOOLS.find(t => t.kind === selectedKind) ?? TOOLS[0];
 
 	// Close any flyout on outside click, mirroring TV behaviour.
 	useEffect(() => {
@@ -71,20 +96,20 @@ export function DrawingToolbar({
 					<button
 						className="tv-btn"
 						type="button"
-						aria-label="Trend Line"
+						aria-label={selected.label}
 						aria-pressed={active}
-						onClick={onToggle}
+						onClick={() => onToggle(selected.kind)}
 					>
 						<span className="tv-icon" role="img" aria-hidden="true">
-							<TrendIcon />
+							<selected.Icon />
 						</span>
-						<span className="tv-tooltip">Trend Line</span>
+						<span className="tv-tooltip">{selected.label}</span>
 					</button>
 				</div>
 				<button
 					className="tv-arrow"
 					type="button"
-					aria-label="Trend tools"
+					aria-label="Line tools"
 					aria-expanded={menuOpen}
 					onClick={() => setMenuOpen(v => !v)}
 				>
@@ -95,19 +120,23 @@ export function DrawingToolbar({
 
 				{menuOpen && (
 					<div className="tv-menu" role="menu">
-						<button
-							className={`tv-menu-item${active ? ' tv-menu-item-active' : ''}`}
-							role="menuitem"
-							onClick={() => {
-								if (!active) onToggle();
-								setMenuOpen(false);
-							}}
-						>
-							<span className="tv-menu-icon">
-								<TrendIcon />
-							</span>
-							<span className="tv-menu-label">Trend Line</span>
-						</button>
+						{TOOLS.map(({ kind, label, Icon }) => (
+							<button
+								key={kind}
+								className={`tv-menu-item${activeKind === kind ? ' tv-menu-item-active' : ''}`}
+								role="menuitem"
+								onClick={() => {
+									setSelectedKind(kind);
+									if (activeKind !== kind) onToggle(kind);
+									setMenuOpen(false);
+								}}
+							>
+								<span className="tv-menu-icon">
+									<Icon />
+								</span>
+								<span className="tv-menu-label">{label}</span>
+							</button>
+						))}
 					</div>
 				)}
 			</div>

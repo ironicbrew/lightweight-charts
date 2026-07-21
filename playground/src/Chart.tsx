@@ -9,7 +9,7 @@ import {
 	type LineData,
 	type Time,
 } from 'lightweight-charts';
-import { TrendLineDrawingTool } from './plugins/trend-line-tool';
+import { TrendLineDrawingTool, type LineKind } from './plugins/trend-line-tool';
 import { DrawingToolbar } from './DrawingToolbar';
 
 type SeriesKind = 'Line' | 'Candlestick';
@@ -68,7 +68,7 @@ export function Chart() {
 	// Canonical bars persist across type toggles so live appends aren't lost.
 	const barsRef = useRef<Bar[]>(makeSeedBars());
 
-	const [drawing, setDrawing] = useState(false);
+	const [activeKind, setActiveKind] = useState<LineKind | null>(null);
 	const [live, setLive] = useState(false);
 	const [seriesType, setSeriesType] = useState<SeriesKind>('Line');
 
@@ -118,7 +118,7 @@ export function Chart() {
 		chart.timeScale().fitContent();
 
 		const tool = new TrendLineDrawingTool(chart, series);
-		tool.onStateChange(setDrawing);
+		tool.onStateChange((_drawing, kind) => setActiveKind(kind));
 		toolRef.current = tool;
 
 		return () => {
@@ -152,8 +152,8 @@ export function Chart() {
 	return (
 		<div style={{ display: 'flex', width: '100%', height: '100%' }}>
 			<DrawingToolbar
-				active={drawing}
-				onToggle={() => toolRef.current?.toggle()}
+				activeKind={activeKind}
+				onToggle={(kind) => toolRef.current?.toggle(kind)}
 				live={live}
 				onToggleLive={() => setLive(v => !v)}
 				candles={seriesType === 'Candlestick'}
