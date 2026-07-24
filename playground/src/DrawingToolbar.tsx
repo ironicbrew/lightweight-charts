@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-export type LineKind = 'segment' | 'ray';
+export type LineKind = 'segment' | 'ray' | 'extended';
 
 interface DrawingToolbarProps {
 	activeKind: LineKind | null;
@@ -33,6 +33,19 @@ const RayIcon = () => (
 	</svg>
 );
 
+// Extended-line glyph: two ringed endpoints with the line trailing off past
+// BOTH of them toward opposite corners — signalling extension in both directions.
+const ExtendedIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			<path d="M3.354 24.354l4-4-.707-.707-4 4z" />
+			<path d="M9.354 18.354l10-10-.707-.707-10 10z" />
+			<path d="M21.354 6.354l4-4-.707-.707-4 4z" />
+			<path d="M8.5 21c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5zM19.5 10c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
 // Settings gear glyph.
 const GearIcon = () => (
 	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -55,6 +68,7 @@ const ArrowIcon = () => (
 const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
 	{ kind: 'segment', label: 'Trend Line', Icon: TrendIcon },
 	{ kind: 'ray', label: 'Ray', Icon: RayIcon },
+	{ kind: 'extended', label: 'Extended Line', Icon: ExtendedIcon },
 ];
 
 export function DrawingToolbar({

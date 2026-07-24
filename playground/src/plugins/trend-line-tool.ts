@@ -29,8 +29,9 @@ interface ViewPoint {
 // Which endpoint: 0 = none, 1 = p1, 2 = p2.
 type Endpoint = 0 | 1 | 2;
 
-// A "segment" stops at p2; a "ray" continues past p2 to infinity.
-export type LineKind = "segment" | "ray";
+// A "segment" stops at both endpoints; a "ray" continues past p2 to infinity;
+// an "extended" line continues past BOTH endpoints to infinity.
+export type LineKind = "segment" | "ray" | "extended";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -88,6 +89,7 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 		private _handleRadius: number,
 		private _hovered: Endpoint,
 		private _showHandles: boolean,
+		private _showEndHandle: boolean,
 		private _kind: LineKind,
 	) {}
 
@@ -111,34 +113,44 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 				const x2 = this._p2.x * hr;
 				const y2 = this._p2.y * vr;
 
-				// For a ray, extend the far end (p2) to the canvas edge so it
-				// reads as continuing to infinity. A segment just stops at p2.
-				let ex = x2;
+				const w = scope.bitmapSize.width;
+				const h = scope.bitmapSize.height;
+
+				// Compute the two drawn ends based on kind:
+				//   segment  → p1 ........ p2   (stops at both)
+				//   ray      → p1 ........ p2 →→ edge   (past p2 only)
+				//   extended → edge ←← p1 .. p2 →→ edge (past both ends)
+				let sx = x1; // start end
+				let sy = y1;
+				let ex = x2; // finish end
 				let ey = y2;
-				if (this._kind === "ray") {
-					[ex, ey] = extendToEdge(
-						x1,
-						y1,
-						x2,
-						y2,
-						scope.bitmapSize.width,
-						scope.bitmapSize.height,
-					);
+
+				// Extend past p2 (direction p1→p2) for ray and extended.
+				if (this._kind === "ray" || this._kind === "extended") {
+					[ex, ey] = extendToEdge(x1, y1, x2, y2, w, h);
+				}
+				// Extend past p1 (direction p2→p1) for extended only.
+				if (this._kind === "extended") {
+					[sx, sy] = extendToEdge(x2, y2, x1, y1, w, h);
 				}
 
 				// The line
 				ctx.lineWidth = this._width;
 				ctx.strokeStyle = this._color;
 				ctx.beginPath();
-				ctx.moveTo(x1, y1);
+				ctx.moveTo(sx, sy);
 				ctx.lineTo(ex, ey);
 				ctx.stroke();
 
 				if (!this._showHandles) return;
 
-				// Endpoint handles (always at the real endpoints, not the extension)
+				// Endpoint handles (always at the real endpoints, not the extension).
+				// The end handle (p2) can be suppressed independently — used while
+				// drawing, when only the anchored first dot should show.
 				this._drawHandle(ctx, x1, y1, hr, this._hovered === 1);
-				this._drawHandle(ctx, x2, y2, hr, this._hovered === 2);
+				if (this._showEndHandle) {
+					this._drawHandle(ctx, x2, y2, hr, this._hovered === 2);
+				}
 			},
 		);
 	}
@@ -182,6 +194,7 @@ class TrendLinePaneView implements IPrimitivePaneView {
 			this._source._options.handleRadius,
 			this._source.hoveredHandle,
 			this._source.showHandles,
+			this._source.showEndHandle,
 			this._source._options.kind,
 		);
 	}
@@ -194,6 +207,7 @@ export class TrendLine implements ISeriesPrimitive<Time> {
 	public _options: TrendLineOptions;
 	public hoveredHandle: Endpoint = 0;
 	public showHandles = true;
+	public showEndHandle = true;
 	private _paneViews: TrendLinePaneView[];
 	private _requestUpdate?: () => void;
 
@@ -260,11 +274,12 @@ export class TrendLine implements ISeriesPrimitive<Time> {
 		const dx = b.x - a.x,
 			dy = b.y - a.y;
 		const lenSq = dx * dx + dy * dy;
-		// Project the point onto the line. Clamp the lower bound to p1 (t=0)
-		// always; clamp the upper bound to p2 (t=1) only for a segment. A ray
-		// extends past p2, so allow t > 1.
+		// Project the point onto the line, then clamp t to the drawn range:
+		//   segment  → [0, 1]        (between the endpoints)
+		//   ray      → [0, ∞)        (extends past p2)
+		//   extended → (-∞, ∞)       (extends past both ends)
 		let t = lenSq === 0 ? 0 : ((x - a.x) * dx + (y - a.y) * dy) / lenSq;
-		t = Math.max(0, t);
+		if (this._options.kind !== "extended") t = Math.max(0, t);
 		if (this._options.kind === "segment") t = Math.min(1, t);
 		const cx = a.x + t * dx,
 			cy = a.y + t * dy;
@@ -284,7 +299,9 @@ class PreviewTrendLine extends TrendLine {
 	constructor(p1: Point, p2: Point, options: Partial<TrendLineOptions> = {}) {
 		super(p1, p2, options);
 		this._options.lineColor = this._options.previewColor;
-		this.showHandles = false; // no draggable dots on the rubber-band preview
+		// Show the anchored first dot, but not one chasing the cursor (the
+		// crosshair already marks that end).
+		this.showEndHandle = false;
 	}
 
 	updateEndPoint(p: Point) {
