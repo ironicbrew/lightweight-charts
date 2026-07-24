@@ -9,6 +9,7 @@ import {
 	type ISeriesPrimitive,
 	type IPrimitivePaneRenderer,
 	type IPrimitivePaneView,
+	type ITimeScaleApi,
 	type MouseEventParams,
 	type SeriesAttachedParameter,
 	type SeriesType,
@@ -40,10 +41,6 @@ function midpoint(a: ViewPoint, b: ViewPoint): ViewPoint {
 // Which endpoint: 0 = none, 1 = p1, 2 = p2.
 type Endpoint = 0 | 1 | 2;
 
-// A "segment" stops at both endpoints; a "ray" continues past p2 to infinity;
-// an "extended" line continues past BOTH endpoints to infinity.
-// A "horizontal" line is a separate shape: a single price anchor, infinite
-// width, no endpoints — placed with one click and dragged vertically.
 export type LineKind =
 	| "segment"
 	| "ray"
@@ -102,7 +99,132 @@ function extendToEdge(
 	return [x1 + t * dx, y1 + t * dy];
 }
 
-// ── Renderer: pure canvas, pixels only ───────────────────────────────────────
+// ── Interaction plumbing ──────────────────────────────────────────────────────
+// A Dragger is created on pointerdown by a primitive's hitTest and is fed the
+// pointer position on every pointermove. Each primitive owns its own draggers,
+// so the controller stays generic (no per-kind branching).
+interface Dragger {
+	move(x: number, y: number): void;
+}
+
+// Tracks incremental whole-bar movement while preserving the sub-bar remainder,
+// so horizontal dragging snaps to bars AND tracks the cursor 1:1.
+class BarTracker {
+	private _lastX: number;
+	constructor(
+		private _ts: ITimeScaleApi<Time>,
+		startX: number,
+	) {
+		this._lastX = startX;
+	}
+
+	// Whole bars crossed since the last consumed step; advances the reference by
+	// exactly those bars (keeping the fractional remainder for next time).
+	step(x: number): number {
+		const cur = this._ts.coordinateToLogical(x);
+		const last = this._ts.coordinateToLogical(this._lastX);
+		const bars = cur !== null && last !== null ? Math.round(cur - last) : 0;
+		if (bars !== 0 && last !== null) {
+			const adv = this._ts.logicalToCoordinate((last + bars) as Logical);
+			if (adv !== null) this._lastX = adv;
+		}
+		return bars;
+	}
+}
+
+// Dragger that sets a single anchor to the snapped cursor position.
+function snapDragger(prim: DrawingPrimitive, apply: (p: Point) => void): Dragger {
+	return {
+		move: (x, y) => {
+			const l = prim.chart.timeScale().coordinateToLogical(x);
+			const price = prim.series.coordinateToPrice(y);
+			if (l !== null && price !== null) apply({ logical: Math.round(l), price });
+		},
+	};
+}
+
+// Dragger that translates a single anchor: whole bars in x, continuous price in
+// y. Used by the cross and horizontal-ray bodies.
+function anchorTranslateDragger(
+	prim: DrawingPrimitive,
+	read: () => Point,
+	write: (p: Point) => void,
+	startX: number,
+	startY: number,
+): Dragger {
+	const tracker = new BarTracker(prim.chart.timeScale(), startX);
+	let lastY = startY;
+	return {
+		move: (x, y) => {
+			const anchor = read();
+			const c = prim.coordOf(anchor);
+			if (c.x === null || c.y === null) return;
+			const dyp = y - lastY;
+			lastY = y;
+			const bars = tracker.step(x);
+			const next = { ...anchor };
+			const np = prim.series.coordinateToPrice((c.y as number) + dyp);
+			if (np !== null) next.price = np;
+			if (bars !== 0) next.logical = anchor.logical + bars;
+			write(next);
+		},
+	};
+}
+
+// Interface for pane views that recompute pixel geometry each frame.
+interface UpdatablePaneView extends IPrimitivePaneView {
+	update(): void;
+}
+
+// ── Base primitive: lifecycle + coordinate helpers shared by every drawing ────
+abstract class DrawingPrimitive implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	protected _views: UpdatablePaneView[] = [];
+	private _requestUpdateFn?: () => void;
+
+	constructor(options: Partial<TrendLineOptions> = {}) {
+		this._options = { ...defaultOptions, ...options };
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdateFn = param.requestUpdate;
+		this._requestUpdateFn?.();
+	}
+
+	detached() {
+		this._requestUpdateFn = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdateFn?.();
+	}
+
+	updateAllViews() {
+		this._views.forEach((v) => v.update());
+	}
+
+	paneViews() {
+		return this._views;
+	}
+
+	// Logical + price → pane-local pixels.
+	coordOf(p: Point): ViewPoint {
+		return {
+			x: this.chart.timeScale().logicalToCoordinate(p.logical as Logical),
+			y: this.series.priceToCoordinate(p.price),
+		};
+	}
+
+	// Interaction contract implemented by each shape.
+	abstract beginDrag(x: number, y: number): Dragger | null;
+	abstract updateHover(x: number, y: number): boolean;
+}
+
+// ── Trend line (segment / ray / extended): two anchored endpoints ─────────────
 class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 	constructor(
 		private _p1: ViewPoint,
@@ -143,21 +265,18 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 				//   segment  → p1 ........ p2   (stops at both)
 				//   ray      → p1 ........ p2 →→ edge   (past p2 only)
 				//   extended → edge ←← p1 .. p2 →→ edge (past both ends)
-				let sx = x1; // start end
+				let sx = x1;
 				let sy = y1;
-				let ex = x2; // finish end
+				let ex = x2;
 				let ey = y2;
 
-				// Extend past p2 (direction p1→p2) for ray and extended.
 				if (this._kind === "ray" || this._kind === "extended") {
 					[ex, ey] = extendToEdge(x1, y1, x2, y2, w, h);
 				}
-				// Extend past p1 (direction p2→p1) for extended only.
 				if (this._kind === "extended") {
 					[sx, sy] = extendToEdge(x2, y2, x1, y1, w, h);
 				}
 
-				// The line
 				ctx.lineWidth = this._width;
 				ctx.strokeStyle = this._color;
 				ctx.beginPath();
@@ -167,9 +286,6 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 
 				if (!this._showHandles) return;
 
-				// Endpoint handles (always at the real endpoints, not the extension).
-				// The end handle (p2) can be suppressed independently — used while
-				// drawing, when only the anchored first dot should show.
 				this._drawHandle(ctx, x1, y1, hr, this._hovered === 1);
 				if (this._showEndHandle) {
 					this._drawHandle(ctx, x2, y2, hr, this._hovered === 2);
@@ -196,8 +312,7 @@ class TrendLinePaneRenderer implements IPrimitivePaneRenderer {
 	}
 }
 
-// ── PaneView: logical (price/time) → pixels, every frame ──────────────────────
-class TrendLinePaneView implements IPrimitivePaneView {
+class TrendLinePaneView implements UpdatablePaneView {
 	private _p1: ViewPoint = { x: null, y: null };
 	private _p2: ViewPoint = { x: null, y: null };
 
@@ -223,59 +338,24 @@ class TrendLinePaneView implements IPrimitivePaneView {
 	}
 }
 
-// ── Primitive: state + lifecycle ──────────────────────────────────────────────
-export class TrendLine implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
+export class TrendLine extends DrawingPrimitive {
 	public hoveredHandle: Endpoint = 0;
 	public showHandles = true;
 	public showEndHandle = true;
-	private _paneViews: TrendLinePaneView[];
-	private _requestUpdate?: () => void;
 
 	constructor(
 		public _p1: Point,
 		public _p2: Point,
 		options: Partial<TrendLineOptions> = {},
 	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new TrendLinePaneView(this)];
+		super(options);
+		this._views = [new TrendLinePaneView(this)];
 	}
 
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	// Current pixel position of an endpoint (pane-local coords).
 	endpointCoord(which: 1 | 2): ViewPoint {
-		const p = which === 1 ? this._p1 : this._p2;
-		return {
-			x: this.chart.timeScale().logicalToCoordinate(p.logical as Logical),
-			y: this.series.priceToCoordinate(p.price),
-		};
+		return this.coordOf(which === 1 ? this._p1 : this._p2);
 	}
 
-	// Returns which endpoint (if any) is within HIT_RADIUS of a pane-local point.
 	hitTestHandle(x: number, y: number): Endpoint {
 		for (const which of [1, 2] as const) {
 			const c = this.endpointCoord(which);
@@ -285,22 +365,15 @@ export class TrendLine implements ISeriesPrimitive<Time> {
 		return 0;
 	}
 
-	// pane-local pixels in, distance on px out
 	hitTestBody(x: number, y: number): boolean {
 		const a = this.endpointCoord(1);
 		const b = this.endpointCoord(2);
-
-		if (a.x === null || a.y === null || b.x === null || b.y === null) {
-			return false;
-		}
+		if (a.x === null || a.y === null || b.x === null || b.y === null) return false;
 
 		const dx = b.x - a.x,
 			dy = b.y - a.y;
 		const lenSq = dx * dx + dy * dy;
-		// Project the point onto the line, then clamp t to the drawn range:
-		//   segment  → [0, 1]        (between the endpoints)
-		//   ray      → [0, ∞)        (extends past p2)
-		//   extended → (-∞, ∞)       (extends past both ends)
+		// Clamp t to the drawn range: segment [0,1], ray [0,∞), extended (-∞,∞).
 		let t = lenSq === 0 ? 0 : ((x - a.x) * dx + (y - a.y) * dy) / lenSq;
 		if (this._options.kind !== "extended") t = Math.max(0, t);
 		if (this._options.kind === "segment") t = Math.min(1, t);
@@ -315,15 +388,53 @@ export class TrendLine implements ISeriesPrimitive<Time> {
 		this.updateAllViews();
 		this.requestUpdate();
 	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		const which = this.hitTestHandle(x, y);
+		if (which !== 0) {
+			return snapDragger(this, (p) => this.setEndpoint(which, p));
+		}
+		if (this.hitTestBody(x, y)) {
+			// Translate both endpoints together: whole bars in x, continuous y.
+			const tracker = new BarTracker(this.chart.timeScale(), x);
+			let lastY = y;
+			return {
+				move: (mx, my) => {
+					const dyp = my - lastY;
+					lastY = my;
+					const bars = tracker.step(mx);
+					for (const w of [1, 2] as const) {
+						const c = this.endpointCoord(w);
+						if (c.x === null || c.y === null) continue;
+						const cur = w === 1 ? this._p1 : this._p2;
+						const next = { ...cur };
+						const np = this.series.coordinateToPrice((c.y as number) + dyp);
+						if (np !== null) next.price = np;
+						if (bars !== 0) next.logical = cur.logical + bars;
+						this.setEndpoint(w, next);
+					}
+				},
+			};
+		}
+		return null;
+	}
+
+	updateHover(x: number, y: number): boolean {
+		const which = this.hitTestHandle(x, y);
+		if (which !== this.hoveredHandle) {
+			this.hoveredHandle = which;
+			this.requestUpdate();
+		}
+		return which !== 0 || this.hitTestBody(x, y);
+	}
 }
 
-// A preview line whose second endpoint tracks the cursor while drawing.
+// Preview line whose second endpoint tracks the cursor while drawing.
 class PreviewTrendLine extends TrendLine {
 	constructor(p1: Point, p2: Point, options: Partial<TrendLineOptions> = {}) {
 		super(p1, p2, options);
 		this._options.lineColor = this._options.previewColor;
-		// Show the anchored first dot, but not one chasing the cursor (the
-		// crosshair already marks that end).
+		// Show the anchored first dot, but not one chasing the cursor.
 		this.showEndHandle = false;
 	}
 
@@ -359,7 +470,7 @@ class HorizontalLinePaneRenderer implements IPrimitivePaneRenderer {
 	}
 }
 
-class HorizontalLinePaneView implements IPrimitivePaneView {
+class HorizontalLinePaneView implements UpdatablePaneView {
 	private _y: Coordinate | null = null;
 
 	constructor(private _source: HorizontalLine) {}
@@ -377,45 +488,15 @@ class HorizontalLinePaneView implements IPrimitivePaneView {
 	}
 }
 
-export class HorizontalLine implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
-	private _paneViews: HorizontalLinePaneView[];
-	private _requestUpdate?: () => void;
-
+export class HorizontalLine extends DrawingPrimitive {
 	constructor(
 		public price: number,
 		options: Partial<TrendLineOptions> = {},
 	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new HorizontalLinePaneView(this)];
+		super(options);
+		this._views = [new HorizontalLinePaneView(this)];
 	}
 
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	// Vertical distance only — the line spans the full width.
 	hitTestBody(_x: number, y: number): boolean {
 		const cy = this.series.priceToCoordinate(this.price);
 		if (cy === null) return false;
@@ -426,6 +507,21 @@ export class HorizontalLine implements ISeriesPrimitive<Time> {
 		this.price = price;
 		this.updateAllViews();
 		this.requestUpdate();
+	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		if (!this.hitTestBody(x, y)) return null;
+		// Flat line: only the price (y) changes.
+		return {
+			move: (_mx, my) => {
+				const price = this.series.coordinateToPrice(my);
+				if (price !== null) this.setPrice(price);
+			},
+		};
+	}
+
+	updateHover(x: number, y: number): boolean {
+		return this.hitTestBody(x, y);
 	}
 }
 
@@ -454,7 +550,7 @@ class VerticalLinePaneRenderer implements IPrimitivePaneRenderer {
 	}
 }
 
-class VerticalLinePaneView implements IPrimitivePaneView {
+class VerticalLinePaneView implements UpdatablePaneView {
 	private _x: Coordinate | null = null;
 
 	constructor(private _source: VerticalLine) {}
@@ -474,45 +570,15 @@ class VerticalLinePaneView implements IPrimitivePaneView {
 	}
 }
 
-export class VerticalLine implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
-	private _paneViews: VerticalLinePaneView[];
-	private _requestUpdate?: () => void;
-
+export class VerticalLine extends DrawingPrimitive {
 	constructor(
 		public logical: number,
 		options: Partial<TrendLineOptions> = {},
 	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new VerticalLinePaneView(this)];
+		super(options);
+		this._views = [new VerticalLinePaneView(this)];
 	}
 
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	// Horizontal distance only — the line spans the full height.
 	hitTestBody(x: number, _y: number): boolean {
 		const cx = this.chart.timeScale().logicalToCoordinate(this.logical as Logical);
 		if (cx === null) return false;
@@ -523,6 +589,22 @@ export class VerticalLine implements ISeriesPrimitive<Time> {
 		this.logical = logical;
 		this.updateAllViews();
 		this.requestUpdate();
+	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		if (!this.hitTestBody(x, y)) return null;
+		// Only the logical (x) changes, snapped to bars.
+		const tracker = new BarTracker(this.chart.timeScale(), x);
+		return {
+			move: (mx) => {
+				const bars = tracker.step(mx);
+				if (bars !== 0) this.setLogical(this.logical + bars);
+			},
+		};
+	}
+
+	updateHover(x: number, y: number): boolean {
+		return this.hitTestBody(x, y);
 	}
 }
 
@@ -544,10 +626,8 @@ class CrossLinePaneRenderer implements IPrimitivePaneRenderer {
 				ctx.lineWidth = this._width;
 				ctx.strokeStyle = this._color;
 				ctx.beginPath();
-				// Horizontal arm
 				ctx.moveTo(0, y);
 				ctx.lineTo(scope.bitmapSize.width, y);
-				// Vertical arm
 				ctx.moveTo(x, 0);
 				ctx.lineTo(x, scope.bitmapSize.height);
 				ctx.stroke();
@@ -556,13 +636,13 @@ class CrossLinePaneRenderer implements IPrimitivePaneRenderer {
 	}
 }
 
-class CrossLinePaneView implements IPrimitivePaneView {
+class CrossLinePaneView implements UpdatablePaneView {
 	private _c: ViewPoint = { x: null, y: null };
 
 	constructor(private _source: CrossLine) {}
 
 	update() {
-		this._c = this._source.anchorCoord();
+		this._c = this._source.coordOf(this._source._anchor);
 	}
 
 	renderer() {
@@ -574,54 +654,18 @@ class CrossLinePaneView implements IPrimitivePaneView {
 	}
 }
 
-export class CrossLine implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
-	private _paneViews: CrossLinePaneView[];
-	private _requestUpdate?: () => void;
-
+export class CrossLine extends DrawingPrimitive {
 	constructor(
 		public _anchor: Point,
 		options: Partial<TrendLineOptions> = {},
 	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new CrossLinePaneView(this)];
-	}
-
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	anchorCoord(): ViewPoint {
-		return {
-			x: this.chart.timeScale().logicalToCoordinate(this._anchor.logical as Logical),
-			y: this.series.priceToCoordinate(this._anchor.price),
-		};
+		super(options);
+		this._views = [new CrossLinePaneView(this)];
 	}
 
 	// Over either arm: near the vertical line (x) OR the horizontal line (y).
 	hitTestBody(x: number, y: number): boolean {
-		const c = this.anchorCoord();
+		const c = this.coordOf(this._anchor);
 		if (c.x === null || c.y === null) return false;
 		return Math.abs(c.x - x) <= BODY_HIT_RADIUS || Math.abs(c.y - y) <= BODY_HIT_RADIUS;
 	}
@@ -631,24 +675,155 @@ export class CrossLine implements ISeriesPrimitive<Time> {
 		this.updateAllViews();
 		this.requestUpdate();
 	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		if (!this.hitTestBody(x, y)) return null;
+		return anchorTranslateDragger(
+			this,
+			() => this._anchor,
+			(p) => this.setAnchor(p),
+			x,
+			y,
+		);
+	}
+
+	updateHover(x: number, y: number): boolean {
+		return this.hitTestBody(x, y);
+	}
+}
+
+// ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
+class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _anchor: ViewPoint,
+		private _color: string,
+		private _width: number,
+		private _handleRadius: number,
+		private _hovered: boolean,
+		private _showHandle: boolean,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				if (this._anchor.x === null || this._anchor.y === null) return;
+				const ctx = scope.context;
+				const x = this._anchor.x * scope.horizontalPixelRatio;
+				const y = this._anchor.y * scope.verticalPixelRatio;
+
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				ctx.moveTo(x, y);
+				ctx.lineTo(scope.bitmapSize.width, y);
+				ctx.stroke();
+
+				if (!this._showHandle) return;
+				const r =
+					(this._hovered ? this._handleRadius + 2 : this._handleRadius) *
+					scope.horizontalPixelRatio;
+				ctx.beginPath();
+				ctx.arc(x, y, r, 0, 2 * Math.PI);
+				ctx.fillStyle = "#111317";
+				ctx.fill();
+				ctx.lineWidth = 2 * scope.horizontalPixelRatio;
+				ctx.strokeStyle = this._color;
+				ctx.stroke();
+			},
+		);
+	}
+}
+
+class HorizontalRayPaneView implements UpdatablePaneView {
+	private _anchor: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: HorizontalRay) {}
+
+	update() {
+		this._anchor = this._source.coordOf(this._source._anchor);
+	}
+
+	renderer() {
+		return new HorizontalRayPaneRenderer(
+			this._anchor,
+			this._source._options.lineColor,
+			this._source._options.width,
+			this._source._options.handleRadius,
+			this._source.hovered,
+			this._source.showHandle,
+		);
+	}
+}
+
+export class HorizontalRay extends DrawingPrimitive {
+	public hovered = false;
+	public showHandle = true;
+
+	constructor(
+		public _anchor: Point,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		super(options);
+		this._views = [new HorizontalRayPaneView(this)];
+	}
+
+	hitTestHandle(x: number, y: number): boolean {
+		const c = this.coordOf(this._anchor);
+		if (c.x === null || c.y === null) return false;
+		return Math.hypot(c.x - x, c.y - y) <= HIT_RADIUS;
+	}
+
+	// The flat body: at the right height AND at or right of the anchor.
+	hitTestBody(x: number, y: number): boolean {
+		const c = this.coordOf(this._anchor);
+		if (c.x === null || c.y === null) return false;
+		return Math.abs(c.y - y) <= BODY_HIT_RADIUS && x >= c.x - BODY_HIT_RADIUS;
+	}
+
+	setAnchor(p: Point) {
+		this._anchor = p;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		if (this.hitTestHandle(x, y)) {
+			// Drag the dot: snapped logical + price, line stays flat.
+			return snapDragger(this, (p) => this.setAnchor(p));
+		}
+		if (this.hitTestBody(x, y)) {
+			return anchorTranslateDragger(
+				this,
+				() => this._anchor,
+				(p) => this.setAnchor(p),
+				x,
+				y,
+			);
+		}
+		return null;
+	}
+
+	updateHover(x: number, y: number): boolean {
+		const on = this.hitTestHandle(x, y);
+		if (on !== this.hovered) {
+			this.hovered = on;
+			this.requestUpdate();
+		}
+		return on || this.hitTestBody(x, y);
+	}
 }
 
 // ── Parallel channel: base line (p1→p2) + a constant price offset ─────────────
 // Model: two base endpoints + a scalar `offset` (price gap). The parallel line
 // is the base shifted by `offset`, so it's ALWAYS parallel and the gap is
-// constant unless the offset itself is changed (by dragging a line body).
+// constant unless the offset itself is changed (by a square resize handle).
 //
 // Four endpoints:  1 = p1, 2 = p2 (base);  3 = p1+offset, 4 = p2+offset.
-// Endpoint 2 and 4 share a logical column, so dragging 2 moves 4 (and 1↔3).
-//
-// Which part: 0 = none, 1..4 = the four endpoints.
 type ChannelHandle = 0 | 1 | 2 | 3 | 4;
-// Which piece of the body a pointer is over.
 type ChannelPart = "base" | "parallel" | "fill" | null;
 
 class ParallelChannelPaneRenderer implements IPrimitivePaneRenderer {
 	constructor(
-		// Base (a1,a2), parallel (b1,b2), midline (m1,m2), all in pixels.
 		private _a1: ViewPoint,
 		private _a2: ViewPoint,
 		private _b1: ViewPoint,
@@ -716,7 +891,7 @@ class ParallelChannelPaneRenderer implements IPrimitivePaneRenderer {
 				}
 
 				if (!this._showHandles) return;
-				// Round endpoint handles: 1,2 on the base line; 3,4 on the parallel.
+				// Round endpoint handles.
 				this._handle(ctx, px(a1), py(a1), hr, this._hovered === 1);
 				this._handle(ctx, px(a2), py(a2), hr, this._hovered === 2);
 				this._handle(ctx, px(b1), py(b1), hr, this._hovered === 3);
@@ -742,7 +917,7 @@ class ParallelChannelPaneRenderer implements IPrimitivePaneRenderer {
 		hovered: boolean,
 	) {
 		const s = (hovered ? this._handleRadius + 2 : this._handleRadius) * ratio;
-		const r = 2 * ratio; // corner radius
+		const r = 2 * ratio;
 		ctx.beginPath();
 		ctx.roundRect(x - s, y - s, s * 2, s * 2, r);
 		ctx.fillStyle = "#111317";
@@ -770,18 +945,17 @@ class ParallelChannelPaneRenderer implements IPrimitivePaneRenderer {
 	}
 }
 
-class ParallelChannelPaneView implements IPrimitivePaneView {
+class ParallelChannelPaneView implements UpdatablePaneView {
 	private _a1: ViewPoint = { x: null, y: null };
 	private _a2: ViewPoint = { x: null, y: null };
 	private _b1: ViewPoint = { x: null, y: null };
 	private _b2: ViewPoint = { x: null, y: null };
 	private _m1: ViewPoint = { x: null, y: null };
 	private _m2: ViewPoint = { x: null, y: null };
-
-	constructor(private _source: ParallelChannel) {}
-
 	private _baseMid: ViewPoint = { x: null, y: null };
 	private _parallelMid: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: ParallelChannel) {}
 
 	update() {
 		const s = this._source;
@@ -793,10 +967,8 @@ class ParallelChannelPaneView implements IPrimitivePaneView {
 		const half = s.offset / 2;
 		this._m1 = s.coordOf({ logical: s._p1.logical, price: s._p1.price + half });
 		this._m2 = s.coordOf({ logical: s._p2.logical, price: s._p2.price + half });
-		// Midpoint handles: average the ENDPOINT PIXELS, not the logicals. A
-		// fractional logical (odd-length line) can't be converted to a coordinate
-		// (logicalToCoordinate needs an integer), so compute the midpoint in pixel
-		// space where fractions are fine.
+		// Midpoint handles are averaged in PIXEL space (see midpoint()) because a
+		// fractional logical (odd-length line) has no coordinate.
 		this._baseMid = midpoint(this._a1, this._a2);
 		this._parallelMid = midpoint(this._b1, this._b2);
 	}
@@ -822,54 +994,19 @@ class ParallelChannelPaneView implements IPrimitivePaneView {
 	}
 }
 
-export class ParallelChannel implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
+export class ParallelChannel extends DrawingPrimitive {
 	public hoveredHandle: ChannelHandle = 0;
 	public hoveredMid: "base" | "parallel" | null = null;
 	public showHandles = true;
-	private _paneViews: ParallelChannelPaneView[];
-	private _requestUpdate?: () => void;
 
 	constructor(
-		public _p1: Point, // base line start
-		public _p2: Point, // base line end
-		public offset: number, // price gap to the parallel line
+		public _p1: Point,
+		public _p2: Point,
+		public offset: number,
 		options: Partial<TrendLineOptions> = {},
 	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new ParallelChannelPaneView(this)];
-	}
-
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	coordOf(p: Point): ViewPoint {
-		return {
-			x: this.chart.timeScale().logicalToCoordinate(p.logical as Logical),
-			y: this.series.priceToCoordinate(p.price),
-		};
+		super(options);
+		this._views = [new ParallelChannelPaneView(this)];
 	}
 
 	// The four endpoints, in handle order (1,2 base; 3,4 parallel).
@@ -892,8 +1029,7 @@ export class ParallelChannel implements ISeriesPrimitive<Time> {
 		return 0;
 	}
 
-	// Which square midpoint handle (if any) the pointer is over. Uses pixel-space
-	// midpoints (see midpoint()) so odd-length lines hit-test correctly too.
+	// Which square midpoint handle (if any). Pixel-space midpoints (see above).
 	hitTestMid(x: number, y: number): "base" | "parallel" | null {
 		const [e1, e2, e3, e4] = this.endpoints();
 		const checks: ["base" | "parallel", ViewPoint][] = [
@@ -949,8 +1085,8 @@ export class ParallelChannel implements ISeriesPrimitive<Time> {
 		return inside;
 	}
 
-	// Drag an endpoint. 1/2 move the base end directly; 3/4 move the base end
-	// so the PARALLEL endpoint lands at p (keeping the offset, hence the gap).
+	// Drag an endpoint. 1/2 move the base end directly; 3/4 move the base end so
+	// the PARALLEL endpoint lands at p (keeping the offset → constant gap).
 	setHandle(which: ChannelHandle, p: Point) {
 		if (which === 1) this._p1 = p;
 		else if (which === 2) this._p2 = p;
@@ -961,9 +1097,6 @@ export class ParallelChannel implements ISeriesPrimitive<Time> {
 	}
 
 	// Resize the gap by a price delta (vertical-only, so no horizontal jump).
-	// Parallel grab: the parallel line moves → offset changes directly.
-	// Base grab: the base line moves by dPrice while the parallel line stays,
-	// so the gap (offset) shrinks/grows by the same amount.
 	resizeBy(part: "base" | "parallel", dPrice: number) {
 		if (part === "parallel") {
 			this.offset += dPrice;
@@ -999,9 +1132,60 @@ export class ParallelChannel implements ISeriesPrimitive<Time> {
 		this.updateAllViews();
 		this.requestUpdate();
 	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		const which = this.hitTestHandle(x, y);
+		if (which !== 0) {
+			return snapDragger(this, (p) => this.setHandle(which, p));
+		}
+		const mid = this.hitTestMid(x, y);
+		if (mid !== null) {
+			// Square handle → vertical-only resize (pixel delta → price delta).
+			let lastY = y;
+			return {
+				move: (_mx, my) => {
+					const cLast = this.series.coordinateToPrice(lastY);
+					const cNow = this.series.coordinateToPrice(my);
+					if (cLast !== null && cNow !== null) {
+						this.resizeBy(mid, cNow - cLast);
+						lastY = my;
+					}
+				},
+			};
+		}
+		if (this.hitTestBody(x, y)) {
+			// Any line or the fill → move the whole channel.
+			const tracker = new BarTracker(this.chart.timeScale(), x);
+			let lastY = y;
+			return {
+				move: (mx, my) => {
+					const c = this.coordOf(this._p1);
+					if (c.x === null || c.y === null) return;
+					const dyp = my - lastY;
+					lastY = my;
+					const bars = tracker.step(mx);
+					const np = this.series.coordinateToPrice((c.y as number) + dyp);
+					const dPrice = np !== null ? np - this._p1.price : 0;
+					if (bars !== 0 || dPrice !== 0) this.translate(bars, dPrice);
+				},
+			};
+		}
+		return null;
+	}
+
+	updateHover(x: number, y: number): boolean {
+		const which = this.hitTestHandle(x, y);
+		const mid = this.hitTestMid(x, y);
+		if (which !== this.hoveredHandle || mid !== this.hoveredMid) {
+			this.hoveredHandle = which;
+			this.hoveredMid = mid;
+			this.requestUpdate();
+		}
+		return which !== 0 || mid !== null || this.hitTestBody(x, y);
+	}
 }
 
-// A preview channel: while picking the offset, the parallel line tracks cursor.
+// Preview channel: while picking the offset, the parallel line tracks the cursor.
 class PreviewParallelChannel extends ParallelChannel {
 	constructor(p1: Point, p2: Point, offset: number, options: Partial<TrendLineOptions> = {}) {
 		super(p1, p2, offset, options);
@@ -1009,173 +1193,68 @@ class PreviewParallelChannel extends ParallelChannel {
 	}
 }
 
-// ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
-class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
-	constructor(
-		private _anchor: ViewPoint,
-		private _color: string,
-		private _width: number,
-		private _handleRadius: number,
-		private _hovered: boolean,
-		private _showHandle: boolean,
-	) {}
-
-	draw(target: CanvasRenderingTarget2D) {
-		target.useBitmapCoordinateSpace(
-			(scope: BitmapCoordinatesRenderingScope) => {
-				if (this._anchor.x === null || this._anchor.y === null) return;
-				const ctx = scope.context;
-				const x = this._anchor.x * scope.horizontalPixelRatio;
-				const y = this._anchor.y * scope.verticalPixelRatio;
-
-				// Flat line from the anchor to the right edge.
-				ctx.lineWidth = this._width;
-				ctx.strokeStyle = this._color;
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(scope.bitmapSize.width, y);
-				ctx.stroke();
-
-				if (!this._showHandle) return;
-				const r =
-					(this._hovered ? this._handleRadius + 2 : this._handleRadius) *
-					scope.horizontalPixelRatio;
-				ctx.beginPath();
-				ctx.arc(x, y, r, 0, 2 * Math.PI);
-				ctx.fillStyle = "#111317";
-				ctx.fill();
-				ctx.lineWidth = 2 * scope.horizontalPixelRatio;
-				ctx.strokeStyle = this._color;
-				ctx.stroke();
-			},
-		);
-	}
+// ── Tool registry: per-kind placement (clicks + build + preview) ──────────────
+interface ToolSpec {
+	clicks: number;
+	build(points: Point[], options: Partial<TrendLineOptions>): DrawingPrimitive;
+	// Preview shown after each click while points.length < clicks (null = none).
+	preview?(points: Point[], options: Partial<TrendLineOptions>): DrawingPrimitive | null;
+	// Update the preview as the cursor moves between clicks.
+	previewCursor?(preview: DrawingPrimitive, cursor: Point): void;
 }
 
-class HorizontalRayPaneView implements IPrimitivePaneView {
-	private _anchor: ViewPoint = { x: null, y: null };
-
-	constructor(private _source: HorizontalRay) {}
-
-	update() {
-		this._anchor = this._source.anchorCoord();
-	}
-
-	renderer() {
-		return new HorizontalRayPaneRenderer(
-			this._anchor,
-			this._source._options.lineColor,
-			this._source._options.width,
-			this._source._options.handleRadius,
-			this._source.hovered,
-			this._source.showHandle,
-		);
-	}
+function twoPointLine(): ToolSpec {
+	return {
+		clicks: 2,
+		build: (pts, o) => new TrendLine(pts[0], pts[1], o),
+		preview: (pts, o) => new PreviewTrendLine(pts[0], pts[0], o),
+		previewCursor: (prev, cur) => (prev as PreviewTrendLine).updateEndPoint(cur),
+	};
 }
 
-export class HorizontalRay implements ISeriesPrimitive<Time> {
-	public chart!: IChartApi;
-	public series!: ISeriesApi<SeriesType>;
-	public _options: TrendLineOptions;
-	public hovered = false;
-	public showHandle = true;
-	private _paneViews: HorizontalRayPaneView[];
-	private _requestUpdate?: () => void;
+const TOOLS: Record<LineKind, ToolSpec> = {
+	segment: twoPointLine(),
+	ray: twoPointLine(),
+	extended: twoPointLine(),
+	horizontal: { clicks: 1, build: (pts, o) => new HorizontalLine(pts[0].price, o) },
+	vertical: { clicks: 1, build: (pts, o) => new VerticalLine(pts[0].logical, o) },
+	cross: { clicks: 1, build: (pts, o) => new CrossLine(pts[0], o) },
+	"horizontal-ray": { clicks: 1, build: (pts, o) => new HorizontalRay(pts[0], o) },
+	channel: {
+		clicks: 3,
+		build: (pts, o) => {
+			const [p1, p2, p3] = pts;
+			const dl = p2.logical - p1.logical;
+			const baseAtP3 =
+				dl === 0
+					? p1.price
+					: p1.price + ((p3.logical - p1.logical) / dl) * (p2.price - p1.price);
+			return new ParallelChannel(p1, p2, p3.price - baseAtP3, o);
+		},
+		// Stage 1 → base-line preview; stage 2 → channel preview at zero offset.
+		preview: (pts, o) =>
+			pts.length === 1
+				? new PreviewTrendLine(pts[0], pts[0], o)
+				: new PreviewParallelChannel(pts[0], pts[1], 0, o),
+		previewCursor: (prev, cur) => {
+			if (prev instanceof PreviewParallelChannel) {
+				prev.setOffsetFromPoint(cur.logical, cur.price);
+			} else {
+				(prev as PreviewTrendLine).updateEndPoint(cur);
+			}
+		},
+	},
+};
 
-	constructor(
-		public _anchor: Point,
-		options: Partial<TrendLineOptions> = {},
-	) {
-		this._options = { ...defaultOptions, ...options };
-		this._paneViews = [new HorizontalRayPaneView(this)];
-	}
-
-	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
-		this.chart = param.chart;
-		this.series = param.series;
-		this._requestUpdate = param.requestUpdate;
-		this._requestUpdate?.();
-	}
-
-	detached() {
-		this._requestUpdate = undefined;
-	}
-
-	requestUpdate() {
-		this._requestUpdate?.();
-	}
-
-	updateAllViews() {
-		this._paneViews.forEach((pw) => pw.update());
-	}
-
-	paneViews() {
-		return this._paneViews;
-	}
-
-	anchorCoord(): ViewPoint {
-		return {
-			x: this.chart.timeScale().logicalToCoordinate(this._anchor.logical as Logical),
-			y: this.series.priceToCoordinate(this._anchor.price),
-		};
-	}
-
-	// Is the pointer over the anchor dot?
-	hitTestHandle(x: number, y: number): boolean {
-		const c = this.anchorCoord();
-		if (c.x === null || c.y === null) return false;
-		return Math.hypot(c.x - x, c.y - y) <= HIT_RADIUS;
-	}
-
-	// Is the pointer over the flat body — at the right height AND at or right of
-	// the anchor (the ray only extends rightward)?
-	hitTestBody(x: number, y: number): boolean {
-		const c = this.anchorCoord();
-		if (c.x === null || c.y === null) return false;
-		return Math.abs(c.y - y) <= BODY_HIT_RADIUS && x >= c.x - BODY_HIT_RADIUS;
-	}
-
-	setAnchor(p: Point) {
-		this._anchor = p;
-		this.updateAllViews();
-		this.requestUpdate();
-	}
-
-	setPrice(price: number) {
-		this._anchor = { ...this._anchor, price };
-		this.updateAllViews();
-		this.requestUpdate();
-	}
-}
-
-// ── Controller: draw new lines AND drag existing endpoints ────────────────────
+// ── Controller: generic over all drawing kinds ────────────────────────────────
 export class TrendLineDrawingTool {
-	private _lines: TrendLine[] = [];
-	private _preview: PreviewTrendLine | undefined;
+	private _drawings: DrawingPrimitive[] = [];
+	private _preview: DrawingPrimitive | undefined;
 	private _points: Point[] = [];
 	private _drawing = false;
 	private _activeKind: LineKind = "segment";
 	private _onStateChange?: (drawing: boolean, kind: LineKind | null) => void;
-
-	// Drag state
-	private _hlines: HorizontalLine[] = [];
-	private _vlines: VerticalLine[] = [];
-	private _hrays: HorizontalRay[] = [];
-	private _crosses: CrossLine[] = [];
-	private _channels: ParallelChannel[] = [];
-	private _channelPreview: PreviewParallelChannel | undefined;
-	private _dragTarget:
-		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
-		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
-		| { hline: HorizontalLine; mode: "hline" }
-		| { vline: VerticalLine; mode: "vline"; last: { x: number } }
-		| { hray: HorizontalRay; mode: "hray-anchor" }
-		| { hray: HorizontalRay; mode: "hray-body"; last: { x: number; y: number } }
-		| { cross: CrossLine; mode: "cross"; last: { x: number; y: number } }
-		| { channel: ParallelChannel; mode: "channel-handle"; which: ChannelHandle }
-		| { channel: ParallelChannel; mode: "channel-move"; last: { x: number; y: number } }
-		| { channel: ParallelChannel; mode: "channel-resize"; part: "base" | "parallel"; lastY: number }
-		| null = null;
+	private _dragger: Dragger | null = null;
 	private readonly _el: HTMLElement;
 
 	constructor(
@@ -1184,7 +1263,6 @@ export class TrendLineDrawingTool {
 		private _options: Partial<TrendLineOptions> = {},
 	) {
 		this._chart.subscribeCrosshairMove(this._moveHandler);
-
 		this._el = this._chart.chartElement();
 		this._el.addEventListener("pointerdown", this._onPointerDown);
 		this._el.addEventListener("pointermove", this._onPointerMove);
@@ -1201,13 +1279,11 @@ export class TrendLineDrawingTool {
 		return this._drawing;
 	}
 
-	// The kind currently being drawn, or null if not drawing.
 	activeKind(): LineKind | null {
 		return this._drawing ? this._activeKind : null;
 	}
 
-	// Toggle drawing. If already drawing a different kind, switch to the new
-	// kind instead of stopping (matches how a toolbar re-click behaves).
+	// Toggle drawing. Re-clicking the active kind stops; a different kind switches.
 	toggle(kind: LineKind = "segment") {
 		if (this._drawing && this._activeKind === kind) {
 			this.stopDrawing();
@@ -1238,182 +1314,33 @@ export class TrendLineDrawingTool {
 		this._el.removeEventListener("pointerdown", this._onPointerDown);
 		this._el.removeEventListener("pointermove", this._onPointerMove);
 		this._el.removeEventListener("pointerup", this._onPointerUp);
-		this._lines.forEach((line) => this._series.detachPrimitive(line));
-		this._lines = [];
-		this._hlines.forEach((line) => this._series.detachPrimitive(line));
-		this._hlines = [];
-		this._vlines.forEach((line) => this._series.detachPrimitive(line));
-		this._vlines = [];
-		this._hrays.forEach((ray) => this._series.detachPrimitive(ray));
-		this._hrays = [];
-		this._crosses.forEach((cross) => this._series.detachPrimitive(cross));
-		this._crosses = [];
-		this._channels.forEach((ch) => this._series.detachPrimitive(ch));
-		this._channels = [];
+		this._drawings.forEach((d) => this._series.detachPrimitive(d));
+		this._drawings = [];
 	}
 
-	// ── Native pointer handling: drag endpoints of finished lines ──────────────
-
-	// Convert a pointer event to pane-local pixel coords.
-	// Right-side price scale + bottom time scale means the pane's origin is the
-	// top-left of the chart element, so a simple rect offset is correct here.
+	// Pane-local pixel coords (right price scale + bottom time scale → origin 0,0).
 	private _paneCoords(e: PointerEvent): { x: number; y: number } {
 		const rect = this._el.getBoundingClientRect();
 		return { x: e.clientX - rect.left, y: e.clientY - rect.top };
 	}
 
 	private _onPointerDown = (e: PointerEvent) => {
+		const { x, y } = this._paneCoords(e);
+
 		if (this._drawing) {
-			const { x, y } = this._paneCoords(e);
+			const l = this._chart.timeScale().coordinateToLogical(x);
 			const price = this._series.coordinateToPrice(y);
-
-			// Horizontal line: one click, price only. Placed and done.
-			if (this._activeKind === "horizontal") {
-				if (price !== null) this._addHorizontalLine(price);
-				return;
-			}
-
-			// Vertical line: one click, snapped logical only.
-			if (this._activeKind === "vertical") {
-				const l = this._chart.timeScale().coordinateToLogical(x);
-				if (l !== null) this._addVerticalLine(Math.round(l));
-				return;
-			}
-
-			// Cross line: one click, price + snapped logical anchor.
-			if (this._activeKind === "cross") {
-				const l = this._chart.timeScale().coordinateToLogical(x);
-				if (l !== null && price !== null) {
-					this._addCrossLine({ logical: Math.round(l), price });
-				}
-				return;
-			}
-
-			// Parallel channel: three clicks (p1, p2 base, then p3 offset).
-			if (this._activeKind === "channel") {
-				const l = this._chart.timeScale().coordinateToLogical(x);
-				if (l !== null && price !== null) {
-					this._addChannelPoint({ logical: Math.round(l), price });
-				}
-				return;
-			}
-
-			// Horizontal ray: one click, price + snapped logical anchor.
-			if (this._activeKind === "horizontal-ray") {
-				const l = this._chart.timeScale().coordinateToLogical(x);
-				if (l !== null && price !== null) {
-					this._addHorizontalRay({ logical: Math.round(l), price });
-				}
-				return;
-			}
-
-			// Two-point kinds: place the point where the press lands (snapped).
-			const logical = this._chart.timeScale().coordinateToLogical(x);
-			if (logical !== null && price !== null) {
-				this._addPoint({ logical: Math.round(logical), price });
+			if (l !== null && price !== null) {
+				this._place({ logical: Math.round(l), price });
 			}
 			return;
 		}
-		const { x, y } = this._paneCoords(e);
 
-		// Parallel channels first: endpoint handle → square resize handle → body.
-		for (let i = this._channels.length - 1; i >= 0; i--) {
-			const ch = this._channels[i];
-			const which = ch.hitTestHandle(x, y);
-			if (which !== 0) {
-				this._dragTarget = { channel: ch, mode: "channel-handle", which };
-				this._beginDrag(e);
-				return;
-			}
-			const mid = ch.hitTestMid(x, y);
-			if (mid !== null) {
-				// Square midpoint handle → vertical resize of the gap.
-				this._dragTarget = {
-					channel: ch,
-					mode: "channel-resize",
-					part: mid,
-					lastY: y,
-				};
-				this._beginDrag(e);
-				return;
-			}
-			if (ch.hitTestBody(x, y)) {
-				// Anywhere on the lines or fill → move the whole channel.
-				this._dragTarget = {
-					channel: ch,
-					mode: "channel-move",
-					last: { x, y },
-				};
-				this._beginDrag(e);
-				return;
-			}
-		}
-
-		// Cross lines next (topmost wins).
-		for (let i = this._crosses.length - 1; i >= 0; i--) {
-			if (this._crosses[i].hitTestBody(x, y)) {
-				this._dragTarget = {
-					cross: this._crosses[i],
-					mode: "cross",
-					last: { x, y },
-				};
-				this._beginDrag(e);
-				return;
-			}
-		}
-
-		// Horizontal rays next (dot beats body).
-		for (let i = this._hrays.length - 1; i >= 0; i--) {
-			if (this._hrays[i].hitTestHandle(x, y)) {
-				this._dragTarget = { hray: this._hrays[i], mode: "hray-anchor" };
-				this._beginDrag(e);
-				return;
-			}
-			if (this._hrays[i].hitTestBody(x, y)) {
-				this._dragTarget = {
-					hray: this._hrays[i],
-					mode: "hray-body",
-					last: { x, y },
-				};
-				this._beginDrag(e);
-				return;
-			}
-		}
-
-		// Horizontal lines next (topmost wins).
-		for (let i = this._hlines.length - 1; i >= 0; i--) {
-			if (this._hlines[i].hitTestBody(x, y)) {
-				this._dragTarget = { hline: this._hlines[i], mode: "hline" };
-				this._beginDrag(e);
-				return;
-			}
-		}
-
-		// Vertical lines next (topmost wins).
-		for (let i = this._vlines.length - 1; i >= 0; i--) {
-			if (this._vlines[i].hitTestBody(x, y)) {
-				this._dragTarget = { vline: this._vlines[i], mode: "vline", last: { x } };
-				this._beginDrag(e);
-				return;
-			}
-		}
-
-		// Topmost trend line wins → search from the end.
-		for (let i = this._lines.length - 1; i >= 0; i--) {
-			const which = this._lines[i].hitTestHandle(x, y);
-			if (which !== 0) {
-				this._dragTarget = { line: this._lines[i], which, mode: "endpoint" };
-				this._beginDrag(e);
-				e.preventDefault();
-				return;
-			}
-			const body = this._lines[i].hitTestBody(x, y);
-			if (body) {
-				this._dragTarget = {
-					line: this._lines[i],
-					mode: "body",
-					last: { x, y },
-				};
+		// Topmost drawing wins → hit-test from the end (latest is drawn on top).
+		for (let i = this._drawings.length - 1; i >= 0; i--) {
+			const dragger = this._drawings[i].beginDrag(x, y);
+			if (dragger) {
+				this._dragger = dragger;
 				this._beginDrag(e);
 				return;
 			}
@@ -1430,364 +1357,63 @@ export class TrendLineDrawingTool {
 	private _onPointerMove = (e: PointerEvent) => {
 		const { x, y } = this._paneCoords(e);
 
-		if (this._dragTarget) {
-			if (this._dragTarget.mode === "hline") {
-				// Flat line: only the price (y) changes.
-				const price = this._series.coordinateToPrice(y);
-				if (price !== null) this._dragTarget.hline.setPrice(price);
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "vline") {
-				// Vertical line: only the logical (x) changes, snapped to bars.
-				const ts = this._chart.timeScale();
-				const curLogical = ts.coordinateToLogical(x);
-				const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
-				const barsMoved =
-					curLogical !== null && lastLogical !== null
-						? Math.round(curLogical - lastLogical)
-						: 0;
-				if (barsMoved !== 0) {
-					const vline = this._dragTarget.vline;
-					vline.setLogical(vline.logical + barsMoved);
-					if (lastLogical !== null) {
-						const advanced = ts.logicalToCoordinate(
-							(lastLogical + barsMoved) as Logical,
-						);
-						if (advanced !== null) this._dragTarget.last.x = advanced;
-					}
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "cross") {
-				// Move both arms: bars in x, continuous price in y.
-				const cross = this._dragTarget.cross;
-				const ts = this._chart.timeScale();
-				const c = cross.anchorCoord();
-				if (c.x !== null && c.y !== null) {
-					const dyp = y - this._dragTarget.last.y;
-					const curLogical = ts.coordinateToLogical(x);
-					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
-					const barsMoved =
-						curLogical !== null && lastLogical !== null
-							? Math.round(curLogical - lastLogical)
-							: 0;
-
-					const next = { ...cross._anchor };
-					const newPrice = this._series.coordinateToPrice(c.y + dyp);
-					if (newPrice !== null) next.price = newPrice;
-					if (barsMoved !== 0) next.logical = cross._anchor.logical + barsMoved;
-					cross.setAnchor(next);
-
-					this._dragTarget.last.y = y;
-					if (barsMoved !== 0 && lastLogical !== null) {
-						const advanced = ts.logicalToCoordinate(
-							(lastLogical + barsMoved) as Logical,
-						);
-						if (advanced !== null) this._dragTarget.last.x = advanced;
-					}
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "channel-handle") {
-				// Drag one endpoint: snapped logical + price. The paired parallel
-				// endpoint follows because the offset is held constant.
-				const logical = this._chart.timeScale().coordinateToLogical(x);
-				const price = this._series.coordinateToPrice(y);
-				if (logical !== null && price !== null) {
-					this._dragTarget.channel.setHandle(this._dragTarget.which, {
-						logical: Math.round(logical),
-						price,
-					});
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "channel-resize") {
-				// Square handle: vertical-only resize. Convert the pixel delta since
-				// last frame into a price delta so there's no horizontal coupling.
-				const cLast = this._series.coordinateToPrice(this._dragTarget.lastY);
-				const cNow = this._series.coordinateToPrice(y);
-				if (cLast !== null && cNow !== null) {
-					this._dragTarget.channel.resizeBy(this._dragTarget.part, cNow - cLast);
-					this._dragTarget.lastY = y;
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "channel-move") {
-				// Drag the fill: translate the whole channel (gap unchanged).
-				const channel = this._dragTarget.channel;
-				const ts = this._chart.timeScale();
-				const c = channel.coordOf(channel._p1);
-				if (c.x !== null && c.y !== null) {
-					const dyp = y - this._dragTarget.last.y;
-					const curLogical = ts.coordinateToLogical(x);
-					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
-					const barsMoved =
-						curLogical !== null && lastLogical !== null
-							? Math.round(curLogical - lastLogical)
-							: 0;
-					const newPrice = this._series.coordinateToPrice(c.y + dyp);
-					const dPrice = newPrice !== null ? newPrice - channel._p1.price : 0;
-					if (barsMoved !== 0 || dPrice !== 0) {
-						channel.translate(barsMoved, dPrice);
-					}
-
-					this._dragTarget.last.y = y;
-					if (barsMoved !== 0 && lastLogical !== null) {
-						const advanced = ts.logicalToCoordinate(
-							(lastLogical + barsMoved) as Logical,
-						);
-						if (advanced !== null) this._dragTarget.last.x = advanced;
-					}
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "hray-anchor") {
-				// Drag the dot: snapped logical + price, line stays flat.
-				const logical = this._chart.timeScale().coordinateToLogical(x);
-				const price = this._series.coordinateToPrice(y);
-				if (logical !== null && price !== null) {
-					this._dragTarget.hray.setAnchor({ logical: Math.round(logical), price });
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "hray-body") {
-				// Translate the whole ray: bars in x, continuous price in y.
-				const ray = this._dragTarget.hray;
-				const ts = this._chart.timeScale();
-				const c = ray.anchorCoord();
-				if (c.x !== null && c.y !== null) {
-					const dyp = y - this._dragTarget.last.y;
-					const curLogical = ts.coordinateToLogical(x);
-					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
-					const barsMoved =
-						curLogical !== null && lastLogical !== null
-							? Math.round(curLogical - lastLogical)
-							: 0;
-
-					const next = { ...ray._anchor };
-					const newPrice = this._series.coordinateToPrice(c.y + dyp);
-					if (newPrice !== null) next.price = newPrice;
-					if (barsMoved !== 0) next.logical = ray._anchor.logical + barsMoved;
-					ray.setAnchor(next);
-
-					this._dragTarget.last.y = y;
-					if (barsMoved !== 0 && lastLogical !== null) {
-						const advanced = ts.logicalToCoordinate(
-							(lastLogical + barsMoved) as Logical,
-						);
-						if (advanced !== null) this._dragTarget.last.x = advanced;
-					}
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "endpoint") {
-				// Convert pixel → data (snapped) and move the grabbed endpoint.
-				const logical = this._chart.timeScale().coordinateToLogical(x);
-				const price = this._series.coordinateToPrice(y);
-				if (logical !== null && price !== null) {
-					this._dragTarget.line.setEndpoint(this._dragTarget.which, {
-						logical: Math.round(logical),
-						price,
-					});
-				}
-				e.preventDefault();
-				return;
-			} else if (this._dragTarget.mode === "body") {
-				const line = this._dragTarget.line;
-				const ts = this._chart.timeScale();
-
-				// Vertical stays continuous.
-				const dyp = y - this._dragTarget.last.y;
-
-				// Horizontal: cursor movement measured in bars, rounded to snap.
-				const curLogical = ts.coordinateToLogical(x);
-				const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
-				const barsMoved =
-					curLogical !== null && lastLogical !== null
-						? Math.round(curLogical - lastLogical)
-						: 0;
-
-				for (const which of [1, 2] as const) {
-					const c = line.endpointCoord(which);
-					if (c.x === null || c.y === null) continue;
-					const cur = which === 1 ? line._p1 : line._p2;
-					const next = { ...cur };
-
-					const newPrice = this._series.coordinateToPrice(c.y + dyp);
-					if (newPrice !== null) next.price = newPrice;
-
-					// Logical is continuous & extrapolates past the data edge, so
-					// adding an integer bar offset keeps the endpoint snapped AND
-					// lets it move beyond the last bar without collapsing.
-					if (barsMoved !== 0) {
-						next.logical = cur.logical + barsMoved;
-					}
-					line.setEndpoint(which, next);
-				}
-
-				this._dragTarget.last.y = y; // y: advance every frame
-				if (barsMoved !== 0 && lastLogical !== null) {
-					// x: advance by ONLY the bars consumed, keeping the sub-bar remainder
-					const advanced = ts.logicalToCoordinate(
-						(lastLogical + barsMoved) as Logical,
-					);
-					if (advanced !== null) this._dragTarget.last.x = advanced;
-				}
-				e.preventDefault();
-				return;
-			}
+		if (this._dragger) {
+			this._dragger.move(x, y);
+			e.preventDefault();
+			return;
 		}
 
 		if (this._drawing) return;
 
-		// Not dragging: hover feedback + grab cursor over a handle or line body.
-		let hovered = false;
-		for (const line of this._lines) {
-			const which = line.hitTestHandle(x, y);
-			if (which !== line.hoveredHandle) {
-				line.hoveredHandle = which;
-				line.requestUpdate();
-			}
-			if (which !== 0) hovered = true;
+		// Hover feedback: let each drawing update its own hover state.
+		let hovering = false;
+		for (const d of this._drawings) {
+			if (d.updateHover(x, y)) hovering = true;
 		}
-		// Hover feedback for horizontal rays (dot enlarges like trend handles).
-		let overHray = false;
-		for (const ray of this._hrays) {
-			const on = ray.hitTestHandle(x, y);
-			if (on !== ray.hovered) {
-				ray.hovered = on;
-				ray.requestUpdate();
-			}
-			if (on || ray.hitTestBody(x, y)) overHray = true;
-		}
-		// Hover feedback for parallel channels (round + square handles enlarge).
-		let overChannel = false;
-		for (const ch of this._channels) {
-			const which = ch.hitTestHandle(x, y);
-			const mid = ch.hitTestMid(x, y);
-			if (which !== ch.hoveredHandle || mid !== ch.hoveredMid) {
-				ch.hoveredHandle = which;
-				ch.hoveredMid = mid;
-				ch.requestUpdate();
-			}
-			if (which !== 0 || mid !== null || ch.hitTestBody(x, y)) overChannel = true;
-		}
-		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
-		const overVline = this._vlines.some((line) => line.hitTestBody(x, y));
-		const overCross = this._crosses.some((cross) => cross.hitTestBody(x, y));
-		this._el.style.cursor =
-			hovered || overHline || overVline || overHray || overCross || overChannel
-				? "grab"
-				: "";
+		this._el.style.cursor = hovering ? "grab" : "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
-		if (!this._dragTarget) return;
-		this._dragTarget = null;
+		if (!this._dragger) return;
+		this._dragger = null;
 		this._el.releasePointerCapture(e.pointerId);
 		this._chart.applyOptions({ handleScroll: true, handleScale: true });
 		this._el.style.cursor = "grab";
 	};
 
-	// ── Drawing new lines ──────────────────────────────────────────────────────
-
+	// Preview tracking as the cursor moves between clicks.
 	private _onDrawMove(param: MouseEventParams) {
-		if (!this._drawing || !param.point) return;
-		const logical = this._chart.timeScale().coordinateToLogical(param.point.x);
+		if (!this._drawing || !param.point || !this._preview) return;
+		const l = this._chart.timeScale().coordinateToLogical(param.point.x);
 		const price = this._series.coordinateToPrice(param.point.y);
-		if (logical === null || price === null) return;
-		const p = { logical: Math.round(logical), price };
+		if (l === null || price === null) return;
+		TOOLS[this._activeKind].previewCursor?.(this._preview, {
+			logical: Math.round(l),
+			price,
+		});
+	}
 
-		// Channel: while picking the offset, the parallel line tracks the cursor
-		// (its gap to the base line at the cursor's column).
-		if (this._channelPreview) {
-			this._channelPreview.setOffsetFromPoint(p.logical, p.price);
+	// Add a click point; commit when the tool has enough, else advance the preview.
+	private _place(p: Point) {
+		const spec = TOOLS[this._activeKind];
+		const options = { ...this._options, kind: this._activeKind };
+		this._points.push(p);
+
+		if (this._points.length >= spec.clicks) {
+			this._removePreview();
+			const drawing = spec.build(this._points, options);
+			this._drawings.push(drawing);
+			this._series.attachPrimitive(drawing);
+			this.stopDrawing();
 			return;
 		}
-		if (this._preview) {
-			this._preview.updateEndPoint(p);
-		}
-	}
 
-	private _addPoint(p: Point) {
-		this._points.push(p);
-		const options = { ...this._options, kind: this._activeKind };
-		if (this._points.length === 1) {
-			this._preview = new PreviewTrendLine(p, p, options);
-			this._series.attachPrimitive(this._preview);
-		} else if (this._points.length >= 2) {
-			this._removePreview();
-			const line = new TrendLine(this._points[0], this._points[1], options);
-			this._lines.push(line);
-			this._series.attachPrimitive(line);
-			this.stopDrawing();
-		}
-	}
-
-	private _addHorizontalLine(price: number) {
-		const line = new HorizontalLine(price, { ...this._options });
-		this._hlines.push(line);
-		this._series.attachPrimitive(line);
-		this.stopDrawing();
-	}
-
-	private _addVerticalLine(logical: number) {
-		const line = new VerticalLine(logical, { ...this._options });
-		this._vlines.push(line);
-		this._series.attachPrimitive(line);
-		this.stopDrawing();
-	}
-
-	private _addCrossLine(anchor: Point) {
-		const cross = new CrossLine(anchor, { ...this._options });
-		this._crosses.push(cross);
-		this._series.attachPrimitive(cross);
-		this.stopDrawing();
-	}
-
-	private _addHorizontalRay(anchor: Point) {
-		const ray = new HorizontalRay(anchor, { ...this._options });
-		this._hrays.push(ray);
-		this._series.attachPrimitive(ray);
-		this.stopDrawing();
-	}
-
-	// Three-stage flow: click 1 = p1, click 2 = p2 (base defined → show channel
-	// preview), click 3 = p3 (commit).
-	private _addChannelPoint(p: Point) {
-		this._points.push(p);
-		const options = { ...this._options, kind: this._activeKind };
-
-		if (this._points.length === 1) {
-			// Base-line preview from p1, second end tracks the cursor.
-			this._preview = new PreviewTrendLine(p, p, options);
-			this._series.attachPrimitive(this._preview);
-		} else if (this._points.length === 2) {
-			// Base fixed → swap the line preview for a channel preview whose
-			// offset (parallel side) follows the cursor. Start at zero offset.
-			this._removePreview();
-			this._channelPreview = new PreviewParallelChannel(
-				this._points[0],
-				this._points[1],
-				0,
-				options,
-			);
-			this._series.attachPrimitive(this._channelPreview);
-		} else if (this._points.length >= 3) {
-			// Third click sets the offset = price gap from the base LINE (at the
-			// click's logical) up to the click.
-			this._removePreview();
-			const [p1, p2, p3] = this._points;
-			const dl = p2.logical - p1.logical;
-			const baseAtP3 =
-				dl === 0
-					? p1.price
-					: p1.price + ((p3.logical - p1.logical) / dl) * (p2.price - p1.price);
-			const offset = p3.price - baseAtP3;
-			const channel = new ParallelChannel(p1, p2, offset, options);
-			this._channels.push(channel);
-			this._series.attachPrimitive(channel);
-			this.stopDrawing();
+		// Rebuild the preview for the new stage (handles the channel's stage swap).
+		this._removePreview();
+		const preview = spec.preview?.(this._points, options);
+		if (preview) {
+			this._preview = preview;
+			this._series.attachPrimitive(preview);
 		}
 	}
 
@@ -1795,10 +1421,6 @@ export class TrendLineDrawingTool {
 		if (this._preview) {
 			this._series.detachPrimitive(this._preview);
 			this._preview = undefined;
-		}
-		if (this._channelPreview) {
-			this._series.detachPrimitive(this._channelPreview);
-			this._channelPreview = undefined;
 		}
 	}
 }
