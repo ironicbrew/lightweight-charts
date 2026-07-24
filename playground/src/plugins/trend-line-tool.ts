@@ -33,7 +33,12 @@ type Endpoint = 0 | 1 | 2;
 // an "extended" line continues past BOTH endpoints to infinity.
 // A "horizontal" line is a separate shape: a single price anchor, infinite
 // width, no endpoints — placed with one click and dragged vertically.
-export type LineKind = "segment" | "ray" | "extended" | "horizontal";
+export type LineKind =
+	| "segment"
+	| "ray"
+	| "extended"
+	| "horizontal"
+	| "horizontal-ray";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -408,6 +413,145 @@ export class HorizontalLine implements ISeriesPrimitive<Time> {
 	}
 }
 
+// ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
+class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _anchor: ViewPoint,
+		private _color: string,
+		private _width: number,
+		private _handleRadius: number,
+		private _hovered: boolean,
+		private _showHandle: boolean,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				if (this._anchor.x === null || this._anchor.y === null) return;
+				const ctx = scope.context;
+				const x = this._anchor.x * scope.horizontalPixelRatio;
+				const y = this._anchor.y * scope.verticalPixelRatio;
+
+				// Flat line from the anchor to the right edge.
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				ctx.moveTo(x, y);
+				ctx.lineTo(scope.bitmapSize.width, y);
+				ctx.stroke();
+
+				if (!this._showHandle) return;
+				const r =
+					(this._hovered ? this._handleRadius + 2 : this._handleRadius) *
+					scope.horizontalPixelRatio;
+				ctx.beginPath();
+				ctx.arc(x, y, r, 0, 2 * Math.PI);
+				ctx.fillStyle = "#111317";
+				ctx.fill();
+				ctx.lineWidth = 2 * scope.horizontalPixelRatio;
+				ctx.strokeStyle = this._color;
+				ctx.stroke();
+			},
+		);
+	}
+}
+
+class HorizontalRayPaneView implements IPrimitivePaneView {
+	private _anchor: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: HorizontalRay) {}
+
+	update() {
+		this._anchor = this._source.anchorCoord();
+	}
+
+	renderer() {
+		return new HorizontalRayPaneRenderer(
+			this._anchor,
+			this._source._options.lineColor,
+			this._source._options.width,
+			this._source._options.handleRadius,
+			this._source.hovered,
+			this._source.showHandle,
+		);
+	}
+}
+
+export class HorizontalRay implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	public hovered = false;
+	public showHandle = true;
+	private _paneViews: HorizontalRayPaneView[];
+	private _requestUpdate?: () => void;
+
+	constructor(
+		public _anchor: Point,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		this._options = { ...defaultOptions, ...options };
+		this._paneViews = [new HorizontalRayPaneView(this)];
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdate = param.requestUpdate;
+		this._requestUpdate?.();
+	}
+
+	detached() {
+		this._requestUpdate = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdate?.();
+	}
+
+	updateAllViews() {
+		this._paneViews.forEach((pw) => pw.update());
+	}
+
+	paneViews() {
+		return this._paneViews;
+	}
+
+	anchorCoord(): ViewPoint {
+		return {
+			x: this.chart.timeScale().logicalToCoordinate(this._anchor.logical as Logical),
+			y: this.series.priceToCoordinate(this._anchor.price),
+		};
+	}
+
+	// Is the pointer over the anchor dot?
+	hitTestHandle(x: number, y: number): boolean {
+		const c = this.anchorCoord();
+		if (c.x === null || c.y === null) return false;
+		return Math.hypot(c.x - x, c.y - y) <= HIT_RADIUS;
+	}
+
+	// Is the pointer over the flat body — at the right height AND at or right of
+	// the anchor (the ray only extends rightward)?
+	hitTestBody(x: number, y: number): boolean {
+		const c = this.anchorCoord();
+		if (c.x === null || c.y === null) return false;
+		return Math.abs(c.y - y) <= BODY_HIT_RADIUS && x >= c.x - BODY_HIT_RADIUS;
+	}
+
+	setAnchor(p: Point) {
+		this._anchor = p;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	setPrice(price: number) {
+		this._anchor = { ...this._anchor, price };
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+}
+
 // ── Controller: draw new lines AND drag existing endpoints ────────────────────
 export class TrendLineDrawingTool {
 	private _lines: TrendLine[] = [];
@@ -419,10 +563,13 @@ export class TrendLineDrawingTool {
 
 	// Drag state
 	private _hlines: HorizontalLine[] = [];
+	private _hrays: HorizontalRay[] = [];
 	private _dragTarget:
 		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
 		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
 		| { hline: HorizontalLine; mode: "hline" }
+		| { hray: HorizontalRay; mode: "hray-anchor" }
+		| { hray: HorizontalRay; mode: "hray-body"; last: { x: number; y: number } }
 		| null = null;
 	private readonly _el: HTMLElement;
 
@@ -490,6 +637,8 @@ export class TrendLineDrawingTool {
 		this._lines = [];
 		this._hlines.forEach((line) => this._series.detachPrimitive(line));
 		this._hlines = [];
+		this._hrays.forEach((ray) => this._series.detachPrimitive(ray));
+		this._hrays = [];
 	}
 
 	// ── Native pointer handling: drag endpoints of finished lines ──────────────
@@ -513,6 +662,15 @@ export class TrendLineDrawingTool {
 				return;
 			}
 
+			// Horizontal ray: one click, price + snapped logical anchor.
+			if (this._activeKind === "horizontal-ray") {
+				const l = this._chart.timeScale().coordinateToLogical(x);
+				if (l !== null && price !== null) {
+					this._addHorizontalRay({ logical: Math.round(l), price });
+				}
+				return;
+			}
+
 			// Two-point kinds: place the point where the press lands (snapped).
 			const logical = this._chart.timeScale().coordinateToLogical(x);
 			if (logical !== null && price !== null) {
@@ -522,7 +680,25 @@ export class TrendLineDrawingTool {
 		}
 		const { x, y } = this._paneCoords(e);
 
-		// Horizontal lines first (topmost wins).
+		// Horizontal rays first (dot beats body).
+		for (let i = this._hrays.length - 1; i >= 0; i--) {
+			if (this._hrays[i].hitTestHandle(x, y)) {
+				this._dragTarget = { hray: this._hrays[i], mode: "hray-anchor" };
+				this._beginDrag(e);
+				return;
+			}
+			if (this._hrays[i].hitTestBody(x, y)) {
+				this._dragTarget = {
+					hray: this._hrays[i],
+					mode: "hray-body",
+					last: { x, y },
+				};
+				this._beginDrag(e);
+				return;
+			}
+		}
+
+		// Horizontal lines next (topmost wins).
 		for (let i = this._hlines.length - 1; i >= 0; i--) {
 			if (this._hlines[i].hitTestBody(x, y)) {
 				this._dragTarget = { hline: this._hlines[i], mode: "hline" };
@@ -568,6 +744,45 @@ export class TrendLineDrawingTool {
 				// Flat line: only the price (y) changes.
 				const price = this._series.coordinateToPrice(y);
 				if (price !== null) this._dragTarget.hline.setPrice(price);
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "hray-anchor") {
+				// Drag the dot: snapped logical + price, line stays flat.
+				const logical = this._chart.timeScale().coordinateToLogical(x);
+				const price = this._series.coordinateToPrice(y);
+				if (logical !== null && price !== null) {
+					this._dragTarget.hray.setAnchor({ logical: Math.round(logical), price });
+				}
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "hray-body") {
+				// Translate the whole ray: bars in x, continuous price in y.
+				const ray = this._dragTarget.hray;
+				const ts = this._chart.timeScale();
+				const c = ray.anchorCoord();
+				if (c.x !== null && c.y !== null) {
+					const dyp = y - this._dragTarget.last.y;
+					const curLogical = ts.coordinateToLogical(x);
+					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
+					const barsMoved =
+						curLogical !== null && lastLogical !== null
+							? Math.round(curLogical - lastLogical)
+							: 0;
+
+					const next = { ...ray._anchor };
+					const newPrice = this._series.coordinateToPrice(c.y + dyp);
+					if (newPrice !== null) next.price = newPrice;
+					if (barsMoved !== 0) next.logical = ray._anchor.logical + barsMoved;
+					ray.setAnchor(next);
+
+					this._dragTarget.last.y = y;
+					if (barsMoved !== 0 && lastLogical !== null) {
+						const advanced = ts.logicalToCoordinate(
+							(lastLogical + barsMoved) as Logical,
+						);
+						if (advanced !== null) this._dragTarget.last.x = advanced;
+					}
+				}
 				e.preventDefault();
 				return;
 			} else if (this._dragTarget.mode === "endpoint") {
@@ -640,8 +855,18 @@ export class TrendLineDrawingTool {
 			}
 			if (which !== 0) hovered = true;
 		}
+		// Hover feedback for horizontal rays (dot enlarges like trend handles).
+		let overHray = false;
+		for (const ray of this._hrays) {
+			const on = ray.hitTestHandle(x, y);
+			if (on !== ray.hovered) {
+				ray.hovered = on;
+				ray.requestUpdate();
+			}
+			if (on || ray.hitTestBody(x, y)) overHray = true;
+		}
 		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
-		this._el.style.cursor = hovered ? "grab" : overHline ? "grab" : "";
+		this._el.style.cursor = hovered || overHline || overHray ? "grab" : "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
@@ -681,6 +906,13 @@ export class TrendLineDrawingTool {
 		const line = new HorizontalLine(price, { ...this._options });
 		this._hlines.push(line);
 		this._series.attachPrimitive(line);
+		this.stopDrawing();
+	}
+
+	private _addHorizontalRay(anchor: Point) {
+		const ray = new HorizontalRay(anchor, { ...this._options });
+		this._hrays.push(ray);
+		this._series.attachPrimitive(ray);
 		this.stopDrawing();
 	}
 

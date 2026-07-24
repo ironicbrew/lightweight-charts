@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-export type LineKind = 'segment' | 'ray' | 'extended' | 'horizontal';
+export type LineKind = 'segment' | 'ray' | 'extended' | 'horizontal' | 'horizontal-ray';
 
 interface DrawingToolbarProps {
 	activeKind: LineKind | null;
@@ -56,6 +56,16 @@ const HorizontalIcon = () => (
 	</svg>
 );
 
+// Horizontal-ray glyph: a dot on the left with a flat line extending right.
+const HorizontalRayIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			<path d="M12 14.5h14v-1H12z" />
+			<path d="M8 15.5c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
 // Settings gear glyph.
 const GearIcon = () => (
 	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -80,6 +90,7 @@ const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
 	{ kind: 'ray', label: 'Ray', Icon: RayIcon },
 	{ kind: 'extended', label: 'Extended Line', Icon: ExtendedIcon },
 	{ kind: 'horizontal', label: 'Horizontal Line', Icon: HorizontalIcon },
+	{ kind: 'horizontal-ray', label: 'Horizontal Ray', Icon: HorizontalRayIcon },
 ];
 
 export function DrawingToolbar({
