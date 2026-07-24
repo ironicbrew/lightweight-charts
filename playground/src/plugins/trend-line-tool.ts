@@ -39,7 +39,8 @@ export type LineKind =
 	| "extended"
 	| "horizontal"
 	| "horizontal-ray"
-	| "vertical";
+	| "vertical"
+	| "cross";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -511,6 +512,113 @@ export class VerticalLine implements ISeriesPrimitive<Time> {
 	}
 }
 
+// ── Cross line: single anchor drawing both a horizontal and vertical line ─────
+class CrossLinePaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _c: ViewPoint,
+		private _color: string,
+		private _width: number,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				if (this._c.x === null || this._c.y === null) return;
+				const ctx = scope.context;
+				const x = this._c.x * scope.horizontalPixelRatio;
+				const y = this._c.y * scope.verticalPixelRatio;
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				// Horizontal arm
+				ctx.moveTo(0, y);
+				ctx.lineTo(scope.bitmapSize.width, y);
+				// Vertical arm
+				ctx.moveTo(x, 0);
+				ctx.lineTo(x, scope.bitmapSize.height);
+				ctx.stroke();
+			},
+		);
+	}
+}
+
+class CrossLinePaneView implements IPrimitivePaneView {
+	private _c: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: CrossLine) {}
+
+	update() {
+		this._c = this._source.anchorCoord();
+	}
+
+	renderer() {
+		return new CrossLinePaneRenderer(
+			this._c,
+			this._source._options.lineColor,
+			this._source._options.width,
+		);
+	}
+}
+
+export class CrossLine implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	private _paneViews: CrossLinePaneView[];
+	private _requestUpdate?: () => void;
+
+	constructor(
+		public _anchor: Point,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		this._options = { ...defaultOptions, ...options };
+		this._paneViews = [new CrossLinePaneView(this)];
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdate = param.requestUpdate;
+		this._requestUpdate?.();
+	}
+
+	detached() {
+		this._requestUpdate = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdate?.();
+	}
+
+	updateAllViews() {
+		this._paneViews.forEach((pw) => pw.update());
+	}
+
+	paneViews() {
+		return this._paneViews;
+	}
+
+	anchorCoord(): ViewPoint {
+		return {
+			x: this.chart.timeScale().logicalToCoordinate(this._anchor.logical as Logical),
+			y: this.series.priceToCoordinate(this._anchor.price),
+		};
+	}
+
+	// Over either arm: near the vertical line (x) OR the horizontal line (y).
+	hitTestBody(x: number, y: number): boolean {
+		const c = this.anchorCoord();
+		if (c.x === null || c.y === null) return false;
+		return Math.abs(c.x - x) <= BODY_HIT_RADIUS || Math.abs(c.y - y) <= BODY_HIT_RADIUS;
+	}
+
+	setAnchor(p: Point) {
+		this._anchor = p;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+}
+
 // ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
 class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
 	constructor(
@@ -663,6 +771,7 @@ export class TrendLineDrawingTool {
 	private _hlines: HorizontalLine[] = [];
 	private _vlines: VerticalLine[] = [];
 	private _hrays: HorizontalRay[] = [];
+	private _crosses: CrossLine[] = [];
 	private _dragTarget:
 		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
 		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
@@ -670,6 +779,7 @@ export class TrendLineDrawingTool {
 		| { vline: VerticalLine; mode: "vline"; last: { x: number } }
 		| { hray: HorizontalRay; mode: "hray-anchor" }
 		| { hray: HorizontalRay; mode: "hray-body"; last: { x: number; y: number } }
+		| { cross: CrossLine; mode: "cross"; last: { x: number; y: number } }
 		| null = null;
 	private readonly _el: HTMLElement;
 
@@ -741,6 +851,8 @@ export class TrendLineDrawingTool {
 		this._vlines = [];
 		this._hrays.forEach((ray) => this._series.detachPrimitive(ray));
 		this._hrays = [];
+		this._crosses.forEach((cross) => this._series.detachPrimitive(cross));
+		this._crosses = [];
 	}
 
 	// ── Native pointer handling: drag endpoints of finished lines ──────────────
@@ -771,6 +883,15 @@ export class TrendLineDrawingTool {
 				return;
 			}
 
+			// Cross line: one click, price + snapped logical anchor.
+			if (this._activeKind === "cross") {
+				const l = this._chart.timeScale().coordinateToLogical(x);
+				if (l !== null && price !== null) {
+					this._addCrossLine({ logical: Math.round(l), price });
+				}
+				return;
+			}
+
 			// Horizontal ray: one click, price + snapped logical anchor.
 			if (this._activeKind === "horizontal-ray") {
 				const l = this._chart.timeScale().coordinateToLogical(x);
@@ -789,7 +910,20 @@ export class TrendLineDrawingTool {
 		}
 		const { x, y } = this._paneCoords(e);
 
-		// Horizontal rays first (dot beats body).
+		// Cross lines first (topmost wins).
+		for (let i = this._crosses.length - 1; i >= 0; i--) {
+			if (this._crosses[i].hitTestBody(x, y)) {
+				this._dragTarget = {
+					cross: this._crosses[i],
+					mode: "cross",
+					last: { x, y },
+				};
+				this._beginDrag(e);
+				return;
+			}
+		}
+
+		// Horizontal rays next (dot beats body).
 		for (let i = this._hrays.length - 1; i >= 0; i--) {
 			if (this._hrays[i].hitTestHandle(x, y)) {
 				this._dragTarget = { hray: this._hrays[i], mode: "hray-anchor" };
@@ -877,6 +1011,36 @@ export class TrendLineDrawingTool {
 					const vline = this._dragTarget.vline;
 					vline.setLogical(vline.logical + barsMoved);
 					if (lastLogical !== null) {
+						const advanced = ts.logicalToCoordinate(
+							(lastLogical + barsMoved) as Logical,
+						);
+						if (advanced !== null) this._dragTarget.last.x = advanced;
+					}
+				}
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "cross") {
+				// Move both arms: bars in x, continuous price in y.
+				const cross = this._dragTarget.cross;
+				const ts = this._chart.timeScale();
+				const c = cross.anchorCoord();
+				if (c.x !== null && c.y !== null) {
+					const dyp = y - this._dragTarget.last.y;
+					const curLogical = ts.coordinateToLogical(x);
+					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
+					const barsMoved =
+						curLogical !== null && lastLogical !== null
+							? Math.round(curLogical - lastLogical)
+							: 0;
+
+					const next = { ...cross._anchor };
+					const newPrice = this._series.coordinateToPrice(c.y + dyp);
+					if (newPrice !== null) next.price = newPrice;
+					if (barsMoved !== 0) next.logical = cross._anchor.logical + barsMoved;
+					cross.setAnchor(next);
+
+					this._dragTarget.last.y = y;
+					if (barsMoved !== 0 && lastLogical !== null) {
 						const advanced = ts.logicalToCoordinate(
 							(lastLogical + barsMoved) as Logical,
 						);
@@ -1006,8 +1170,9 @@ export class TrendLineDrawingTool {
 		}
 		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
 		const overVline = this._vlines.some((line) => line.hitTestBody(x, y));
+		const overCross = this._crosses.some((cross) => cross.hitTestBody(x, y));
 		this._el.style.cursor =
-			hovered || overHline || overVline || overHray ? "grab" : "";
+			hovered || overHline || overVline || overHray || overCross ? "grab" : "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
@@ -1054,6 +1219,13 @@ export class TrendLineDrawingTool {
 		const line = new VerticalLine(logical, { ...this._options });
 		this._vlines.push(line);
 		this._series.attachPrimitive(line);
+		this.stopDrawing();
+	}
+
+	private _addCrossLine(anchor: Point) {
+		const cross = new CrossLine(anchor, { ...this._options });
+		this._crosses.push(cross);
+		this._series.attachPrimitive(cross);
 		this.stopDrawing();
 	}
 
