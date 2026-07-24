@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-export type LineKind = 'segment' | 'ray' | 'extended';
+export type LineKind = 'segment' | 'ray' | 'extended' | 'horizontal';
 
 interface DrawingToolbarProps {
 	activeKind: LineKind | null;
@@ -46,6 +46,16 @@ const ExtendedIcon = () => (
 	</svg>
 );
 
+// Horizontal-line glyph: a flat line spanning the width with a single mid dot.
+const HorizontalIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			<path d="M2 14.5h9v-1H2zM17 14.5h9v-1h-9z" />
+			<path d="M14 15.5c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
 // Settings gear glyph.
 const GearIcon = () => (
 	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -69,6 +79,7 @@ const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
 	{ kind: 'segment', label: 'Trend Line', Icon: TrendIcon },
 	{ kind: 'ray', label: 'Ray', Icon: RayIcon },
 	{ kind: 'extended', label: 'Extended Line', Icon: ExtendedIcon },
+	{ kind: 'horizontal', label: 'Horizontal Line', Icon: HorizontalIcon },
 ];
 
 export function DrawingToolbar({

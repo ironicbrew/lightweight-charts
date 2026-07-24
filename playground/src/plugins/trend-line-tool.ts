@@ -31,7 +31,9 @@ type Endpoint = 0 | 1 | 2;
 
 // A "segment" stops at both endpoints; a "ray" continues past p2 to infinity;
 // an "extended" line continues past BOTH endpoints to infinity.
-export type LineKind = "segment" | "ray" | "extended";
+// A "horizontal" line is a separate shape: a single price anchor, infinite
+// width, no endpoints — placed with one click and dragged vertically.
+export type LineKind = "segment" | "ray" | "extended" | "horizontal";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -311,6 +313,101 @@ class PreviewTrendLine extends TrendLine {
 	}
 }
 
+// ── Horizontal line: single price anchor, infinite width, no endpoints ────────
+class HorizontalLinePaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _y: Coordinate | null,
+		private _color: string,
+		private _width: number,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				if (this._y === null) return;
+				const ctx = scope.context;
+				const y = this._y * scope.verticalPixelRatio;
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				ctx.moveTo(0, y);
+				ctx.lineTo(scope.bitmapSize.width, y);
+				ctx.stroke();
+			},
+		);
+	}
+}
+
+class HorizontalLinePaneView implements IPrimitivePaneView {
+	private _y: Coordinate | null = null;
+
+	constructor(private _source: HorizontalLine) {}
+
+	update() {
+		this._y = this._source.series.priceToCoordinate(this._source.price);
+	}
+
+	renderer() {
+		return new HorizontalLinePaneRenderer(
+			this._y,
+			this._source._options.lineColor,
+			this._source._options.width,
+		);
+	}
+}
+
+export class HorizontalLine implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	private _paneViews: HorizontalLinePaneView[];
+	private _requestUpdate?: () => void;
+
+	constructor(
+		public price: number,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		this._options = { ...defaultOptions, ...options };
+		this._paneViews = [new HorizontalLinePaneView(this)];
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdate = param.requestUpdate;
+		this._requestUpdate?.();
+	}
+
+	detached() {
+		this._requestUpdate = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdate?.();
+	}
+
+	updateAllViews() {
+		this._paneViews.forEach((pw) => pw.update());
+	}
+
+	paneViews() {
+		return this._paneViews;
+	}
+
+	// Vertical distance only — the line spans the full width.
+	hitTestBody(_x: number, y: number): boolean {
+		const cy = this.series.priceToCoordinate(this.price);
+		if (cy === null) return false;
+		return Math.abs(cy - y) <= BODY_HIT_RADIUS;
+	}
+
+	setPrice(price: number) {
+		this.price = price;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+}
+
 // ── Controller: draw new lines AND drag existing endpoints ────────────────────
 export class TrendLineDrawingTool {
 	private _lines: TrendLine[] = [];
@@ -321,9 +418,11 @@ export class TrendLineDrawingTool {
 	private _onStateChange?: (drawing: boolean, kind: LineKind | null) => void;
 
 	// Drag state
+	private _hlines: HorizontalLine[] = [];
 	private _dragTarget:
 		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
 		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
+		| { hline: HorizontalLine; mode: "hline" }
 		| null = null;
 	private readonly _el: HTMLElement;
 
@@ -389,6 +488,8 @@ export class TrendLineDrawingTool {
 		this._el.removeEventListener("pointerup", this._onPointerUp);
 		this._lines.forEach((line) => this._series.detachPrimitive(line));
 		this._lines = [];
+		this._hlines.forEach((line) => this._series.detachPrimitive(line));
+		this._hlines = [];
 	}
 
 	// ── Native pointer handling: drag endpoints of finished lines ──────────────
@@ -403,10 +504,17 @@ export class TrendLineDrawingTool {
 
 	private _onPointerDown = (e: PointerEvent) => {
 		if (this._drawing) {
-			// Place the point exactly where the press lands (snapped to a bar).
 			const { x, y } = this._paneCoords(e);
-			const logical = this._chart.timeScale().coordinateToLogical(x);
 			const price = this._series.coordinateToPrice(y);
+
+			// Horizontal line: one click, price only. Placed and done.
+			if (this._activeKind === "horizontal") {
+				if (price !== null) this._addHorizontalLine(price);
+				return;
+			}
+
+			// Two-point kinds: place the point where the press lands (snapped).
+			const logical = this._chart.timeScale().coordinateToLogical(x);
 			if (logical !== null && price !== null) {
 				this._addPoint({ logical: Math.round(logical), price });
 			}
@@ -414,7 +522,16 @@ export class TrendLineDrawingTool {
 		}
 		const { x, y } = this._paneCoords(e);
 
-		// Topmost line wins → search from the end.
+		// Horizontal lines first (topmost wins).
+		for (let i = this._hlines.length - 1; i >= 0; i--) {
+			if (this._hlines[i].hitTestBody(x, y)) {
+				this._dragTarget = { hline: this._hlines[i], mode: "hline" };
+				this._beginDrag(e);
+				return;
+			}
+		}
+
+		// Topmost trend line wins → search from the end.
 		for (let i = this._lines.length - 1; i >= 0; i--) {
 			const which = this._lines[i].hitTestHandle(x, y);
 			if (which !== 0) {
@@ -447,7 +564,13 @@ export class TrendLineDrawingTool {
 		const { x, y } = this._paneCoords(e);
 
 		if (this._dragTarget) {
-			if (this._dragTarget.mode === "endpoint") {
+			if (this._dragTarget.mode === "hline") {
+				// Flat line: only the price (y) changes.
+				const price = this._series.coordinateToPrice(y);
+				if (price !== null) this._dragTarget.hline.setPrice(price);
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "endpoint") {
 				// Convert pixel → data (snapped) and move the grabbed endpoint.
 				const logical = this._chart.timeScale().coordinateToLogical(x);
 				const price = this._series.coordinateToPrice(y);
@@ -507,7 +630,7 @@ export class TrendLineDrawingTool {
 
 		if (this._drawing) return;
 
-		// Not dragging: hover feedback + grab cursor over a handle.
+		// Not dragging: hover feedback + grab cursor over a handle or line body.
 		let hovered = false;
 		for (const line of this._lines) {
 			const which = line.hitTestHandle(x, y);
@@ -517,7 +640,8 @@ export class TrendLineDrawingTool {
 			}
 			if (which !== 0) hovered = true;
 		}
-		this._el.style.cursor = hovered ? "grab" : "";
+		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
+		this._el.style.cursor = hovered ? "grab" : overHline ? "grab" : "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
@@ -551,6 +675,13 @@ export class TrendLineDrawingTool {
 			this._series.attachPrimitive(line);
 			this.stopDrawing();
 		}
+	}
+
+	private _addHorizontalLine(price: number) {
+		const line = new HorizontalLine(price, { ...this._options });
+		this._hlines.push(line);
+		this._series.attachPrimitive(line);
+		this.stopDrawing();
 	}
 
 	private _removePreview() {
