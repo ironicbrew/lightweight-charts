@@ -26,6 +26,17 @@ interface ViewPoint {
 	y: Coordinate | null;
 }
 
+// Pixel-space midpoint of two view points (null if either is off-scale).
+function midpoint(a: ViewPoint, b: ViewPoint): ViewPoint {
+	if (a.x === null || a.y === null || b.x === null || b.y === null) {
+		return { x: null, y: null };
+	}
+	return {
+		x: ((a.x + b.x) / 2) as Coordinate,
+		y: ((a.y + b.y) / 2) as Coordinate,
+	};
+}
+
 // Which endpoint: 0 = none, 1 = p1, 2 = p2.
 type Endpoint = 0 | 1 | 2;
 
@@ -40,11 +51,13 @@ export type LineKind =
 	| "horizontal"
 	| "horizontal-ray"
 	| "vertical"
-	| "cross";
+	| "cross"
+	| "channel";
 
 export interface TrendLineOptions {
 	lineColor: string;
 	previewColor: string;
+	fillColor: string;
 	width: number;
 	handleRadius: number; // CSS px
 	kind: LineKind;
@@ -53,6 +66,7 @@ export interface TrendLineOptions {
 const defaultOptions: TrendLineOptions = {
 	lineColor: "#2962FF",
 	previewColor: "rgba(41, 98, 255, 0.5)",
+	fillColor: "rgba(41, 98, 255, 0.1)",
 	width: 2,
 	handleRadius: 5,
 	kind: "segment",
@@ -619,6 +633,382 @@ export class CrossLine implements ISeriesPrimitive<Time> {
 	}
 }
 
+// ── Parallel channel: base line (p1→p2) + a constant price offset ─────────────
+// Model: two base endpoints + a scalar `offset` (price gap). The parallel line
+// is the base shifted by `offset`, so it's ALWAYS parallel and the gap is
+// constant unless the offset itself is changed (by dragging a line body).
+//
+// Four endpoints:  1 = p1, 2 = p2 (base);  3 = p1+offset, 4 = p2+offset.
+// Endpoint 2 and 4 share a logical column, so dragging 2 moves 4 (and 1↔3).
+//
+// Which part: 0 = none, 1..4 = the four endpoints.
+type ChannelHandle = 0 | 1 | 2 | 3 | 4;
+// Which piece of the body a pointer is over.
+type ChannelPart = "base" | "parallel" | "fill" | null;
+
+class ParallelChannelPaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		// Base (a1,a2), parallel (b1,b2), midline (m1,m2), all in pixels.
+		private _a1: ViewPoint,
+		private _a2: ViewPoint,
+		private _b1: ViewPoint,
+		private _b2: ViewPoint,
+		private _m1: ViewPoint,
+		private _m2: ViewPoint,
+		private _baseMid: ViewPoint,
+		private _parallelMid: ViewPoint,
+		private _color: string,
+		private _fillColor: string,
+		private _width: number,
+		private _handleRadius: number,
+		private _hovered: ChannelHandle,
+		private _hoveredMid: "base" | "parallel" | null,
+		private _showHandles: boolean,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				const a1 = this._a1, a2 = this._a2, b1 = this._b1, b2 = this._b2;
+				const m1 = this._m1, m2 = this._m2;
+				if (
+					a1.x === null || a1.y === null || a2.x === null || a2.y === null ||
+					b1.x === null || b1.y === null || b2.x === null || b2.y === null
+				) {
+					return;
+				}
+				const ctx = scope.context;
+				const hr = scope.horizontalPixelRatio;
+				const vr = scope.verticalPixelRatio;
+				const px = (p: ViewPoint) => (p.x as number) * hr;
+				const py = (p: ViewPoint) => (p.y as number) * vr;
+
+				// Filled band between the two parallel lines.
+				ctx.fillStyle = this._fillColor;
+				ctx.beginPath();
+				ctx.moveTo(px(a1), py(a1));
+				ctx.lineTo(px(a2), py(a2));
+				ctx.lineTo(px(b2), py(b2));
+				ctx.lineTo(px(b1), py(b1));
+				ctx.closePath();
+				ctx.fill();
+
+				// The two solid parallel lines.
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				ctx.moveTo(px(a1), py(a1));
+				ctx.lineTo(px(a2), py(a2));
+				ctx.moveTo(px(b1), py(b1));
+				ctx.lineTo(px(b2), py(b2));
+				ctx.stroke();
+
+				// Dotted midline (visual only, not interactive).
+				if (m1.x !== null && m1.y !== null && m2.x !== null && m2.y !== null) {
+					ctx.save();
+					ctx.setLineDash([4 * hr, 4 * hr]);
+					ctx.lineWidth = Math.max(1, this._width - 1);
+					ctx.beginPath();
+					ctx.moveTo(px(m1), py(m1));
+					ctx.lineTo(px(m2), py(m2));
+					ctx.stroke();
+					ctx.restore();
+				}
+
+				if (!this._showHandles) return;
+				// Round endpoint handles: 1,2 on the base line; 3,4 on the parallel.
+				this._handle(ctx, px(a1), py(a1), hr, this._hovered === 1);
+				this._handle(ctx, px(a2), py(a2), hr, this._hovered === 2);
+				this._handle(ctx, px(b1), py(b1), hr, this._hovered === 3);
+				this._handle(ctx, px(b2), py(b2), hr, this._hovered === 4);
+
+				// Square resize handles at each line's midpoint (vertical resize).
+				const bm = this._baseMid, pm = this._parallelMid;
+				if (bm.x !== null && bm.y !== null) {
+					this._square(ctx, px(bm), py(bm), hr, this._hoveredMid === "base");
+				}
+				if (pm.x !== null && pm.y !== null) {
+					this._square(ctx, px(pm), py(pm), hr, this._hoveredMid === "parallel");
+				}
+			},
+		);
+	}
+
+	private _square(
+		ctx: CanvasRenderingContext2D,
+		x: number,
+		y: number,
+		ratio: number,
+		hovered: boolean,
+	) {
+		const s = (hovered ? this._handleRadius + 2 : this._handleRadius) * ratio;
+		const r = 2 * ratio; // corner radius
+		ctx.beginPath();
+		ctx.roundRect(x - s, y - s, s * 2, s * 2, r);
+		ctx.fillStyle = "#111317";
+		ctx.fill();
+		ctx.lineWidth = 2 * ratio;
+		ctx.strokeStyle = this._color;
+		ctx.stroke();
+	}
+
+	private _handle(
+		ctx: CanvasRenderingContext2D,
+		x: number,
+		y: number,
+		ratio: number,
+		hovered: boolean,
+	) {
+		const r = (hovered ? this._handleRadius + 2 : this._handleRadius) * ratio;
+		ctx.beginPath();
+		ctx.arc(x, y, r, 0, 2 * Math.PI);
+		ctx.fillStyle = "#111317";
+		ctx.fill();
+		ctx.lineWidth = 2 * ratio;
+		ctx.strokeStyle = this._color;
+		ctx.stroke();
+	}
+}
+
+class ParallelChannelPaneView implements IPrimitivePaneView {
+	private _a1: ViewPoint = { x: null, y: null };
+	private _a2: ViewPoint = { x: null, y: null };
+	private _b1: ViewPoint = { x: null, y: null };
+	private _b2: ViewPoint = { x: null, y: null };
+	private _m1: ViewPoint = { x: null, y: null };
+	private _m2: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: ParallelChannel) {}
+
+	private _baseMid: ViewPoint = { x: null, y: null };
+	private _parallelMid: ViewPoint = { x: null, y: null };
+
+	update() {
+		const s = this._source;
+		const [e1, e2, e3, e4] = s.endpoints();
+		this._a1 = s.coordOf(e1);
+		this._a2 = s.coordOf(e2);
+		this._b1 = s.coordOf(e3);
+		this._b2 = s.coordOf(e4);
+		const half = s.offset / 2;
+		this._m1 = s.coordOf({ logical: s._p1.logical, price: s._p1.price + half });
+		this._m2 = s.coordOf({ logical: s._p2.logical, price: s._p2.price + half });
+		// Midpoint handles: average the ENDPOINT PIXELS, not the logicals. A
+		// fractional logical (odd-length line) can't be converted to a coordinate
+		// (logicalToCoordinate needs an integer), so compute the midpoint in pixel
+		// space where fractions are fine.
+		this._baseMid = midpoint(this._a1, this._a2);
+		this._parallelMid = midpoint(this._b1, this._b2);
+	}
+
+	renderer() {
+		return new ParallelChannelPaneRenderer(
+			this._a1,
+			this._a2,
+			this._b1,
+			this._b2,
+			this._m1,
+			this._m2,
+			this._baseMid,
+			this._parallelMid,
+			this._source._options.lineColor,
+			this._source._options.fillColor,
+			this._source._options.width,
+			this._source._options.handleRadius,
+			this._source.hoveredHandle,
+			this._source.hoveredMid,
+			this._source.showHandles,
+		);
+	}
+}
+
+export class ParallelChannel implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	public hoveredHandle: ChannelHandle = 0;
+	public hoveredMid: "base" | "parallel" | null = null;
+	public showHandles = true;
+	private _paneViews: ParallelChannelPaneView[];
+	private _requestUpdate?: () => void;
+
+	constructor(
+		public _p1: Point, // base line start
+		public _p2: Point, // base line end
+		public offset: number, // price gap to the parallel line
+		options: Partial<TrendLineOptions> = {},
+	) {
+		this._options = { ...defaultOptions, ...options };
+		this._paneViews = [new ParallelChannelPaneView(this)];
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdate = param.requestUpdate;
+		this._requestUpdate?.();
+	}
+
+	detached() {
+		this._requestUpdate = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdate?.();
+	}
+
+	updateAllViews() {
+		this._paneViews.forEach((pw) => pw.update());
+	}
+
+	paneViews() {
+		return this._paneViews;
+	}
+
+	coordOf(p: Point): ViewPoint {
+		return {
+			x: this.chart.timeScale().logicalToCoordinate(p.logical as Logical),
+			y: this.series.priceToCoordinate(p.price),
+		};
+	}
+
+	// The four endpoints, in handle order (1,2 base; 3,4 parallel).
+	endpoints(): [Point, Point, Point, Point] {
+		return [
+			this._p1,
+			this._p2,
+			{ logical: this._p1.logical, price: this._p1.price + this.offset },
+			{ logical: this._p2.logical, price: this._p2.price + this.offset },
+		];
+	}
+
+	hitTestHandle(x: number, y: number): ChannelHandle {
+		const eps = this.endpoints();
+		for (let i = 0; i < 4; i++) {
+			const c = this.coordOf(eps[i]);
+			if (c.x === null || c.y === null) continue;
+			if (Math.hypot(c.x - x, c.y - y) <= HIT_RADIUS) return (i + 1) as ChannelHandle;
+		}
+		return 0;
+	}
+
+	// Which square midpoint handle (if any) the pointer is over. Uses pixel-space
+	// midpoints (see midpoint()) so odd-length lines hit-test correctly too.
+	hitTestMid(x: number, y: number): "base" | "parallel" | null {
+		const [e1, e2, e3, e4] = this.endpoints();
+		const checks: ["base" | "parallel", ViewPoint][] = [
+			["base", midpoint(this.coordOf(e1), this.coordOf(e2))],
+			["parallel", midpoint(this.coordOf(e3), this.coordOf(e4))],
+		];
+		for (const [part, c] of checks) {
+			if (c.x === null || c.y === null) continue;
+			if (Math.abs(c.x - x) <= HIT_RADIUS && Math.abs(c.y - y) <= HIT_RADIUS) {
+				return part;
+			}
+		}
+		return null;
+	}
+
+	// Which part of the body the pointer is over: a stroke line, the fill, or none.
+	hitPart(x: number, y: number): ChannelPart {
+		const [e1, e2, e3, e4] = this.endpoints();
+		const a1 = this.coordOf(e1), a2 = this.coordOf(e2);
+		const b1 = this.coordOf(e3), b2 = this.coordOf(e4);
+		if (this._nearSegment(x, y, a1, a2)) return "base";
+		if (this._nearSegment(x, y, b1, b2)) return "parallel";
+		if (this._inQuad(x, y, a1, a2, b2, b1)) return "fill";
+		return null;
+	}
+
+	hitTestBody(x: number, y: number): boolean {
+		return this.hitPart(x, y) !== null;
+	}
+
+	private _nearSegment(x: number, y: number, a: ViewPoint, b: ViewPoint): boolean {
+		if (a.x === null || a.y === null || b.x === null || b.y === null) return false;
+		const dx = b.x - a.x, dy = b.y - a.y;
+		const lenSq = dx * dx + dy * dy;
+		let t = lenSq === 0 ? 0 : ((x - a.x) * dx + (y - a.y) * dy) / lenSq;
+		t = Math.max(0, Math.min(1, t));
+		const cx = a.x + t * dx, cy = a.y + t * dy;
+		return Math.hypot(x - cx, y - cy) <= BODY_HIT_RADIUS;
+	}
+
+	// Even-odd point-in-polygon for the band quad (order: a1,a2,b2,b1).
+	private _inQuad(x: number, y: number, ...quad: ViewPoint[]): boolean {
+		if (quad.some((p) => p.x === null || p.y === null)) return false;
+		let inside = false;
+		for (let i = 0, j = quad.length - 1; i < quad.length; j = i++) {
+			const xi = quad[i].x as number, yi = quad[i].y as number;
+			const xj = quad[j].x as number, yj = quad[j].y as number;
+			const intersect =
+				yi > y !== yj > y &&
+				x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+			if (intersect) inside = !inside;
+		}
+		return inside;
+	}
+
+	// Drag an endpoint. 1/2 move the base end directly; 3/4 move the base end
+	// so the PARALLEL endpoint lands at p (keeping the offset, hence the gap).
+	setHandle(which: ChannelHandle, p: Point) {
+		if (which === 1) this._p1 = p;
+		else if (which === 2) this._p2 = p;
+		else if (which === 3) this._p1 = { logical: p.logical, price: p.price - this.offset };
+		else if (which === 4) this._p2 = { logical: p.logical, price: p.price - this.offset };
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	// Resize the gap by a price delta (vertical-only, so no horizontal jump).
+	// Parallel grab: the parallel line moves → offset changes directly.
+	// Base grab: the base line moves by dPrice while the parallel line stays,
+	// so the gap (offset) shrinks/grows by the same amount.
+	resizeBy(part: "base" | "parallel", dPrice: number) {
+		if (part === "parallel") {
+			this.offset += dPrice;
+		} else {
+			this._p1 = { ...this._p1, price: this._p1.price + dPrice };
+			this._p2 = { ...this._p2, price: this._p2.price + dPrice };
+			this.offset -= dPrice;
+		}
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	// Set the offset so the parallel line passes through `price` at `logical`.
+	// Used only while drawing (the preview's parallel side tracks the cursor).
+	setOffsetFromPoint(logical: number, price: number) {
+		const dl = this._p2.logical - this._p1.logical;
+		const baseAt =
+			dl === 0
+				? this._p1.price
+				: this._p1.price +
+				  ((logical - this._p1.logical) / dl) * (this._p2.price - this._p1.price);
+		this.offset = price - baseAt;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	// Move the whole channel (offset unchanged → gap unchanged).
+	translate(bars: number, dPrice: number) {
+		for (const p of [this._p1, this._p2]) {
+			p.logical += bars;
+			p.price += dPrice;
+		}
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+}
+
+// A preview channel: while picking the offset, the parallel line tracks cursor.
+class PreviewParallelChannel extends ParallelChannel {
+	constructor(p1: Point, p2: Point, offset: number, options: Partial<TrendLineOptions> = {}) {
+		super(p1, p2, offset, options);
+		this._options.lineColor = this._options.previewColor;
+	}
+}
+
 // ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
 class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
 	constructor(
@@ -772,6 +1162,8 @@ export class TrendLineDrawingTool {
 	private _vlines: VerticalLine[] = [];
 	private _hrays: HorizontalRay[] = [];
 	private _crosses: CrossLine[] = [];
+	private _channels: ParallelChannel[] = [];
+	private _channelPreview: PreviewParallelChannel | undefined;
 	private _dragTarget:
 		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
 		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
@@ -780,6 +1172,9 @@ export class TrendLineDrawingTool {
 		| { hray: HorizontalRay; mode: "hray-anchor" }
 		| { hray: HorizontalRay; mode: "hray-body"; last: { x: number; y: number } }
 		| { cross: CrossLine; mode: "cross"; last: { x: number; y: number } }
+		| { channel: ParallelChannel; mode: "channel-handle"; which: ChannelHandle }
+		| { channel: ParallelChannel; mode: "channel-move"; last: { x: number; y: number } }
+		| { channel: ParallelChannel; mode: "channel-resize"; part: "base" | "parallel"; lastY: number }
 		| null = null;
 	private readonly _el: HTMLElement;
 
@@ -853,6 +1248,8 @@ export class TrendLineDrawingTool {
 		this._hrays = [];
 		this._crosses.forEach((cross) => this._series.detachPrimitive(cross));
 		this._crosses = [];
+		this._channels.forEach((ch) => this._series.detachPrimitive(ch));
+		this._channels = [];
 	}
 
 	// ── Native pointer handling: drag endpoints of finished lines ──────────────
@@ -892,6 +1289,15 @@ export class TrendLineDrawingTool {
 				return;
 			}
 
+			// Parallel channel: three clicks (p1, p2 base, then p3 offset).
+			if (this._activeKind === "channel") {
+				const l = this._chart.timeScale().coordinateToLogical(x);
+				if (l !== null && price !== null) {
+					this._addChannelPoint({ logical: Math.round(l), price });
+				}
+				return;
+			}
+
 			// Horizontal ray: one click, price + snapped logical anchor.
 			if (this._activeKind === "horizontal-ray") {
 				const l = this._chart.timeScale().coordinateToLogical(x);
@@ -910,7 +1316,40 @@ export class TrendLineDrawingTool {
 		}
 		const { x, y } = this._paneCoords(e);
 
-		// Cross lines first (topmost wins).
+		// Parallel channels first: endpoint handle → square resize handle → body.
+		for (let i = this._channels.length - 1; i >= 0; i--) {
+			const ch = this._channels[i];
+			const which = ch.hitTestHandle(x, y);
+			if (which !== 0) {
+				this._dragTarget = { channel: ch, mode: "channel-handle", which };
+				this._beginDrag(e);
+				return;
+			}
+			const mid = ch.hitTestMid(x, y);
+			if (mid !== null) {
+				// Square midpoint handle → vertical resize of the gap.
+				this._dragTarget = {
+					channel: ch,
+					mode: "channel-resize",
+					part: mid,
+					lastY: y,
+				};
+				this._beginDrag(e);
+				return;
+			}
+			if (ch.hitTestBody(x, y)) {
+				// Anywhere on the lines or fill → move the whole channel.
+				this._dragTarget = {
+					channel: ch,
+					mode: "channel-move",
+					last: { x, y },
+				};
+				this._beginDrag(e);
+				return;
+			}
+		}
+
+		// Cross lines next (topmost wins).
 		for (let i = this._crosses.length - 1; i >= 0; i--) {
 			if (this._crosses[i].hitTestBody(x, y)) {
 				this._dragTarget = {
@@ -1049,6 +1488,59 @@ export class TrendLineDrawingTool {
 				}
 				e.preventDefault();
 				return;
+			} else if (this._dragTarget.mode === "channel-handle") {
+				// Drag one endpoint: snapped logical + price. The paired parallel
+				// endpoint follows because the offset is held constant.
+				const logical = this._chart.timeScale().coordinateToLogical(x);
+				const price = this._series.coordinateToPrice(y);
+				if (logical !== null && price !== null) {
+					this._dragTarget.channel.setHandle(this._dragTarget.which, {
+						logical: Math.round(logical),
+						price,
+					});
+				}
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "channel-resize") {
+				// Square handle: vertical-only resize. Convert the pixel delta since
+				// last frame into a price delta so there's no horizontal coupling.
+				const cLast = this._series.coordinateToPrice(this._dragTarget.lastY);
+				const cNow = this._series.coordinateToPrice(y);
+				if (cLast !== null && cNow !== null) {
+					this._dragTarget.channel.resizeBy(this._dragTarget.part, cNow - cLast);
+					this._dragTarget.lastY = y;
+				}
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "channel-move") {
+				// Drag the fill: translate the whole channel (gap unchanged).
+				const channel = this._dragTarget.channel;
+				const ts = this._chart.timeScale();
+				const c = channel.coordOf(channel._p1);
+				if (c.x !== null && c.y !== null) {
+					const dyp = y - this._dragTarget.last.y;
+					const curLogical = ts.coordinateToLogical(x);
+					const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
+					const barsMoved =
+						curLogical !== null && lastLogical !== null
+							? Math.round(curLogical - lastLogical)
+							: 0;
+					const newPrice = this._series.coordinateToPrice(c.y + dyp);
+					const dPrice = newPrice !== null ? newPrice - channel._p1.price : 0;
+					if (barsMoved !== 0 || dPrice !== 0) {
+						channel.translate(barsMoved, dPrice);
+					}
+
+					this._dragTarget.last.y = y;
+					if (barsMoved !== 0 && lastLogical !== null) {
+						const advanced = ts.logicalToCoordinate(
+							(lastLogical + barsMoved) as Logical,
+						);
+						if (advanced !== null) this._dragTarget.last.x = advanced;
+					}
+				}
+				e.preventDefault();
+				return;
 			} else if (this._dragTarget.mode === "hray-anchor") {
 				// Drag the dot: snapped logical + price, line stays flat.
 				const logical = this._chart.timeScale().coordinateToLogical(x);
@@ -1168,11 +1660,25 @@ export class TrendLineDrawingTool {
 			}
 			if (on || ray.hitTestBody(x, y)) overHray = true;
 		}
+		// Hover feedback for parallel channels (round + square handles enlarge).
+		let overChannel = false;
+		for (const ch of this._channels) {
+			const which = ch.hitTestHandle(x, y);
+			const mid = ch.hitTestMid(x, y);
+			if (which !== ch.hoveredHandle || mid !== ch.hoveredMid) {
+				ch.hoveredHandle = which;
+				ch.hoveredMid = mid;
+				ch.requestUpdate();
+			}
+			if (which !== 0 || mid !== null || ch.hitTestBody(x, y)) overChannel = true;
+		}
 		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
 		const overVline = this._vlines.some((line) => line.hitTestBody(x, y));
 		const overCross = this._crosses.some((cross) => cross.hitTestBody(x, y));
 		this._el.style.cursor =
-			hovered || overHline || overVline || overHray || overCross ? "grab" : "";
+			hovered || overHline || overVline || overHray || overCross || overChannel
+				? "grab"
+				: "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
@@ -1186,11 +1692,21 @@ export class TrendLineDrawingTool {
 	// ── Drawing new lines ──────────────────────────────────────────────────────
 
 	private _onDrawMove(param: MouseEventParams) {
-		if (!this._drawing || !param.point || !this._preview) return;
+		if (!this._drawing || !param.point) return;
 		const logical = this._chart.timeScale().coordinateToLogical(param.point.x);
 		const price = this._series.coordinateToPrice(param.point.y);
 		if (logical === null || price === null) return;
-		this._preview.updateEndPoint({ logical: Math.round(logical), price });
+		const p = { logical: Math.round(logical), price };
+
+		// Channel: while picking the offset, the parallel line tracks the cursor
+		// (its gap to the base line at the cursor's column).
+		if (this._channelPreview) {
+			this._channelPreview.setOffsetFromPoint(p.logical, p.price);
+			return;
+		}
+		if (this._preview) {
+			this._preview.updateEndPoint(p);
+		}
 	}
 
 	private _addPoint(p: Point) {
@@ -1236,10 +1752,53 @@ export class TrendLineDrawingTool {
 		this.stopDrawing();
 	}
 
+	// Three-stage flow: click 1 = p1, click 2 = p2 (base defined → show channel
+	// preview), click 3 = p3 (commit).
+	private _addChannelPoint(p: Point) {
+		this._points.push(p);
+		const options = { ...this._options, kind: this._activeKind };
+
+		if (this._points.length === 1) {
+			// Base-line preview from p1, second end tracks the cursor.
+			this._preview = new PreviewTrendLine(p, p, options);
+			this._series.attachPrimitive(this._preview);
+		} else if (this._points.length === 2) {
+			// Base fixed → swap the line preview for a channel preview whose
+			// offset (parallel side) follows the cursor. Start at zero offset.
+			this._removePreview();
+			this._channelPreview = new PreviewParallelChannel(
+				this._points[0],
+				this._points[1],
+				0,
+				options,
+			);
+			this._series.attachPrimitive(this._channelPreview);
+		} else if (this._points.length >= 3) {
+			// Third click sets the offset = price gap from the base LINE (at the
+			// click's logical) up to the click.
+			this._removePreview();
+			const [p1, p2, p3] = this._points;
+			const dl = p2.logical - p1.logical;
+			const baseAtP3 =
+				dl === 0
+					? p1.price
+					: p1.price + ((p3.logical - p1.logical) / dl) * (p2.price - p1.price);
+			const offset = p3.price - baseAtP3;
+			const channel = new ParallelChannel(p1, p2, offset, options);
+			this._channels.push(channel);
+			this._series.attachPrimitive(channel);
+			this.stopDrawing();
+		}
+	}
+
 	private _removePreview() {
 		if (this._preview) {
 			this._series.detachPrimitive(this._preview);
 			this._preview = undefined;
+		}
+		if (this._channelPreview) {
+			this._series.detachPrimitive(this._channelPreview);
+			this._channelPreview = undefined;
 		}
 	}
 }

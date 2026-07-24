@@ -7,7 +7,8 @@ export type LineKind =
 	| 'horizontal'
 	| 'horizontal-ray'
 	| 'vertical'
-	| 'cross';
+	| 'cross'
+	| 'channel';
 
 interface DrawingToolbarProps {
 	activeKind: LineKind | null;
@@ -93,6 +94,17 @@ const CrossIcon = () => (
 	</svg>
 );
 
+// Parallel-channel glyph: two parallel diagonal lines with anchor dots.
+const ChannelIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			<path d="M4.354 18.354l14-14-.707-.707-14 14z" />
+			<path d="M9.354 23.354l14-14-.707-.707-14 14z" />
+			<path d="M18.5 5c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5zM4.5 19c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5zM23.5 10c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
 // Settings gear glyph.
 const GearIcon = () => (
 	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -120,6 +132,7 @@ const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
 	{ kind: 'horizontal-ray', label: 'Horizontal Ray', Icon: HorizontalRayIcon },
 	{ kind: 'vertical', label: 'Vertical Line', Icon: VerticalIcon },
 	{ kind: 'cross', label: 'Cross Line', Icon: CrossIcon },
+	{ kind: 'channel', label: 'Parallel Channel', Icon: ChannelIcon },
 ];
 
 export function DrawingToolbar({
