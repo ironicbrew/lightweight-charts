@@ -38,7 +38,8 @@ export type LineKind =
 	| "ray"
 	| "extended"
 	| "horizontal"
-	| "horizontal-ray";
+	| "horizontal-ray"
+	| "vertical";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -413,6 +414,103 @@ export class HorizontalLine implements ISeriesPrimitive<Time> {
 	}
 }
 
+// ── Vertical line: single logical anchor, infinite height, no endpoints ───────
+class VerticalLinePaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _x: Coordinate | null,
+		private _color: string,
+		private _width: number,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace(
+			(scope: BitmapCoordinatesRenderingScope) => {
+				if (this._x === null) return;
+				const ctx = scope.context;
+				const x = this._x * scope.horizontalPixelRatio;
+				ctx.lineWidth = this._width;
+				ctx.strokeStyle = this._color;
+				ctx.beginPath();
+				ctx.moveTo(x, 0);
+				ctx.lineTo(x, scope.bitmapSize.height);
+				ctx.stroke();
+			},
+		);
+	}
+}
+
+class VerticalLinePaneView implements IPrimitivePaneView {
+	private _x: Coordinate | null = null;
+
+	constructor(private _source: VerticalLine) {}
+
+	update() {
+		this._x = this._source.chart
+			.timeScale()
+			.logicalToCoordinate(this._source.logical as Logical);
+	}
+
+	renderer() {
+		return new VerticalLinePaneRenderer(
+			this._x,
+			this._source._options.lineColor,
+			this._source._options.width,
+		);
+	}
+}
+
+export class VerticalLine implements ISeriesPrimitive<Time> {
+	public chart!: IChartApi;
+	public series!: ISeriesApi<SeriesType>;
+	public _options: TrendLineOptions;
+	private _paneViews: VerticalLinePaneView[];
+	private _requestUpdate?: () => void;
+
+	constructor(
+		public logical: number,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		this._options = { ...defaultOptions, ...options };
+		this._paneViews = [new VerticalLinePaneView(this)];
+	}
+
+	attached(param: SeriesAttachedParameter<Time, SeriesType>) {
+		this.chart = param.chart;
+		this.series = param.series;
+		this._requestUpdate = param.requestUpdate;
+		this._requestUpdate?.();
+	}
+
+	detached() {
+		this._requestUpdate = undefined;
+	}
+
+	requestUpdate() {
+		this._requestUpdate?.();
+	}
+
+	updateAllViews() {
+		this._paneViews.forEach((pw) => pw.update());
+	}
+
+	paneViews() {
+		return this._paneViews;
+	}
+
+	// Horizontal distance only — the line spans the full height.
+	hitTestBody(x: number, _y: number): boolean {
+		const cx = this.chart.timeScale().logicalToCoordinate(this.logical as Logical);
+		if (cx === null) return false;
+		return Math.abs(cx - x) <= BODY_HIT_RADIUS;
+	}
+
+	setLogical(logical: number) {
+		this.logical = logical;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+}
+
 // ── Horizontal ray: one anchored endpoint (dot), flat line to the right ───────
 class HorizontalRayPaneRenderer implements IPrimitivePaneRenderer {
 	constructor(
@@ -563,11 +661,13 @@ export class TrendLineDrawingTool {
 
 	// Drag state
 	private _hlines: HorizontalLine[] = [];
+	private _vlines: VerticalLine[] = [];
 	private _hrays: HorizontalRay[] = [];
 	private _dragTarget:
 		| { line: TrendLine; mode: "endpoint"; which: 1 | 2 }
 		| { line: TrendLine; mode: "body"; last: { x: number; y: number } }
 		| { hline: HorizontalLine; mode: "hline" }
+		| { vline: VerticalLine; mode: "vline"; last: { x: number } }
 		| { hray: HorizontalRay; mode: "hray-anchor" }
 		| { hray: HorizontalRay; mode: "hray-body"; last: { x: number; y: number } }
 		| null = null;
@@ -637,6 +737,8 @@ export class TrendLineDrawingTool {
 		this._lines = [];
 		this._hlines.forEach((line) => this._series.detachPrimitive(line));
 		this._hlines = [];
+		this._vlines.forEach((line) => this._series.detachPrimitive(line));
+		this._vlines = [];
 		this._hrays.forEach((ray) => this._series.detachPrimitive(ray));
 		this._hrays = [];
 	}
@@ -659,6 +761,13 @@ export class TrendLineDrawingTool {
 			// Horizontal line: one click, price only. Placed and done.
 			if (this._activeKind === "horizontal") {
 				if (price !== null) this._addHorizontalLine(price);
+				return;
+			}
+
+			// Vertical line: one click, snapped logical only.
+			if (this._activeKind === "vertical") {
+				const l = this._chart.timeScale().coordinateToLogical(x);
+				if (l !== null) this._addVerticalLine(Math.round(l));
 				return;
 			}
 
@@ -707,6 +816,15 @@ export class TrendLineDrawingTool {
 			}
 		}
 
+		// Vertical lines next (topmost wins).
+		for (let i = this._vlines.length - 1; i >= 0; i--) {
+			if (this._vlines[i].hitTestBody(x, y)) {
+				this._dragTarget = { vline: this._vlines[i], mode: "vline", last: { x } };
+				this._beginDrag(e);
+				return;
+			}
+		}
+
 		// Topmost trend line wins → search from the end.
 		for (let i = this._lines.length - 1; i >= 0; i--) {
 			const which = this._lines[i].hitTestHandle(x, y);
@@ -744,6 +862,27 @@ export class TrendLineDrawingTool {
 				// Flat line: only the price (y) changes.
 				const price = this._series.coordinateToPrice(y);
 				if (price !== null) this._dragTarget.hline.setPrice(price);
+				e.preventDefault();
+				return;
+			} else if (this._dragTarget.mode === "vline") {
+				// Vertical line: only the logical (x) changes, snapped to bars.
+				const ts = this._chart.timeScale();
+				const curLogical = ts.coordinateToLogical(x);
+				const lastLogical = ts.coordinateToLogical(this._dragTarget.last.x);
+				const barsMoved =
+					curLogical !== null && lastLogical !== null
+						? Math.round(curLogical - lastLogical)
+						: 0;
+				if (barsMoved !== 0) {
+					const vline = this._dragTarget.vline;
+					vline.setLogical(vline.logical + barsMoved);
+					if (lastLogical !== null) {
+						const advanced = ts.logicalToCoordinate(
+							(lastLogical + barsMoved) as Logical,
+						);
+						if (advanced !== null) this._dragTarget.last.x = advanced;
+					}
+				}
 				e.preventDefault();
 				return;
 			} else if (this._dragTarget.mode === "hray-anchor") {
@@ -866,7 +1005,9 @@ export class TrendLineDrawingTool {
 			if (on || ray.hitTestBody(x, y)) overHray = true;
 		}
 		const overHline = this._hlines.some((line) => line.hitTestBody(x, y));
-		this._el.style.cursor = hovered || overHline || overHray ? "grab" : "";
+		const overVline = this._vlines.some((line) => line.hitTestBody(x, y));
+		this._el.style.cursor =
+			hovered || overHline || overVline || overHray ? "grab" : "";
 	};
 
 	private _onPointerUp = (e: PointerEvent) => {
@@ -905,6 +1046,13 @@ export class TrendLineDrawingTool {
 	private _addHorizontalLine(price: number) {
 		const line = new HorizontalLine(price, { ...this._options });
 		this._hlines.push(line);
+		this._series.attachPrimitive(line);
+		this.stopDrawing();
+	}
+
+	private _addVerticalLine(logical: number) {
+		const line = new VerticalLine(logical, { ...this._options });
+		this._vlines.push(line);
 		this._series.attachPrimitive(line);
 		this.stopDrawing();
 	}
