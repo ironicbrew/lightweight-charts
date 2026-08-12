@@ -25,6 +25,8 @@ interface DrawingToolbarProps {
 	onToggleRSI: () => void;
 	macdEnabled: boolean;
 	onToggleMACD: () => void;
+	ichimokuEnabled: boolean;
+	onToggleIchimoku: () => void;
 }
 
 // TradingView's trendline glyph (diagonal line + two ringed endpoints).
@@ -182,6 +184,8 @@ export function DrawingToolbar({
 	onToggleRSI,
 	macdEnabled,
 	onToggleMACD,
+	ichimokuEnabled,
+	onToggleIchimoku,
 }: DrawingToolbarProps) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
@@ -344,6 +348,18 @@ export function DrawingToolbar({
 							/>
 							<span className="tv-menu-label">MACD (12,26,9)</span>
 							<span className="tv-ma-swatch" style={{ background: '#2962FF' }} />
+						</button>
+						<button
+							className="tv-menu-item"
+							role="menuitemcheckbox"
+							aria-checked={ichimokuEnabled}
+							onClick={onToggleIchimoku}
+						>
+							<span className={`tv-check${ichimokuEnabled ? ' tv-check-on' : ''}`}
+								style={ichimokuEnabled ? { background: '#1e88e5', borderColor: '#1e88e5' } : undefined}
+							/>
+							<span className="tv-menu-label">Ichimoku Cloud</span>
+							<span className="tv-ma-swatch" style={{ background: '#1e88e5' }} />
 						</button>
 					</div>
 				)}

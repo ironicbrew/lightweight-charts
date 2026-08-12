@@ -13,6 +13,7 @@ import { TrendLineDrawingTool, type LineKind } from './plugins/trend-line-tool';
 import { MovingAverageTool } from './plugins/moving-average-tool';
 import { RsiTool } from './plugins/rsi-tool';
 import { MacdTool } from './plugins/macd-tool';
+import { IchimokuTool } from './plugins/ichimoku-tool';
 import { DrawingToolbar } from './DrawingToolbar';
 
 type SeriesKind = 'Line' | 'Candlestick';
@@ -70,6 +71,7 @@ export function Chart() {
 	const maToolRef = useRef<MovingAverageTool | null>(null);
 	const rsiToolRef = useRef<RsiTool | null>(null);
 	const macdToolRef = useRef<MacdTool | null>(null);
+	const ichimokuToolRef = useRef<IchimokuTool | null>(null);
 	const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Candlestick'> | null>(null);
 	// Canonical bars persist across type toggles so live appends aren't lost.
 	const barsRef = useRef<Bar[]>(makeSeedBars());
@@ -81,6 +83,7 @@ export function Chart() {
 	const [enabledMAs, setEnabledMAs] = useState<Set<number>>(new Set());
 	const [rsiEnabled, setRsiEnabled] = useState(false);
 	const [macdEnabled, setMacdEnabled] = useState(false);
+	const [ichimokuEnabled, setIchimokuEnabled] = useState(false);
 
 	// Build the chart + series + drawing tool. Rebuilds when the series type
 	// changes (swapping the series requires a fresh series object and tool).
@@ -146,11 +149,16 @@ export function Chart() {
 		if (macdEnabled) macdTool.enable(bars);
 		macdToolRef.current = macdTool;
 
+		const ichimokuTool = new IchimokuTool(chart);
+		if (ichimokuEnabled) ichimokuTool.enable(bars);
+		ichimokuToolRef.current = ichimokuTool;
+
 		return () => {
 			tool.remove();
 			maTool.remove();
 			rsiTool.remove();
 			macdTool.remove();
+			ichimokuTool.remove();
 			chart.remove();
 			chartRef.current = null;
 			seriesRef.current = null;
@@ -158,6 +166,7 @@ export function Chart() {
 			maToolRef.current = null;
 			rsiToolRef.current = null;
 			macdToolRef.current = null;
+			ichimokuToolRef.current = null;
 		};
 	}, [seriesType]);
 
@@ -179,6 +188,7 @@ export function Chart() {
 			maToolRef.current?.appendBar(bars);
 			rsiToolRef.current?.appendBar(bars);
 			macdToolRef.current?.appendBar(bars);
+			ichimokuToolRef.current?.appendBar(bars);
 		}, 1000);
 		return () => clearInterval(id);
 	}, [live, seriesType]);
@@ -195,6 +205,13 @@ export function Chart() {
 		if (!macdTool) return;
 		const nowEnabled = macdTool.toggle(barsRef.current);
 		setMacdEnabled(nowEnabled);
+	};
+
+	const handleToggleIchimoku = () => {
+		const ichimokuTool = ichimokuToolRef.current;
+		if (!ichimokuTool) return;
+		const nowEnabled = ichimokuTool.toggle(barsRef.current);
+		setIchimokuEnabled(nowEnabled);
 	};
 
 	const handleToggleMA = (period: number) => {
@@ -224,6 +241,8 @@ export function Chart() {
 				onToggleRSI={handleToggleRSI}
 				macdEnabled={macdEnabled}
 				onToggleMACD={handleToggleMACD}
+				ichimokuEnabled={ichimokuEnabled}
+				onToggleIchimoku={handleToggleIchimoku}
 			/>
 			<div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
 				<div ref={containerRef} style={{ width: '100%', height: '100%' }} />
