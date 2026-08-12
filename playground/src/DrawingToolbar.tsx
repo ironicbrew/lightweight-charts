@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { MA_PRESETS } from './plugins/moving-average-tool';
 
 export type LineKind =
 	| 'segment'
@@ -8,7 +9,8 @@ export type LineKind =
 	| 'horizontal-ray'
 	| 'vertical'
 	| 'cross'
-	| 'channel';
+	| 'channel'
+	| 'pitchfork';
 
 interface DrawingToolbarProps {
 	activeKind: LineKind | null;
@@ -17,6 +19,10 @@ interface DrawingToolbarProps {
 	onToggleLive: () => void;
 	candles: boolean;
 	onToggleCandles: () => void;
+	enabledMAs: Set<number>;
+	onToggleMA: (period: number) => void;
+	rsiEnabled: boolean;
+	onToggleRSI: () => void;
 }
 
 // TradingView's trendline glyph (diagonal line + two ringed endpoints).
@@ -105,6 +111,31 @@ const ChannelIcon = () => (
 	</svg>
 );
 
+// Pitchfork (Andrews' Pitchfork) glyph: pivot dot, cross-bar with two tine dots,
+// and three diverging rays.
+const PitchforkIcon = () => (
+	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+		<g fill="currentColor" fillRule="nonzero">
+			{/* Handle shaft: pivot (bottom-left) up to mid cross-bar */}
+			<path d="M7.5 22.5l5-8-.9-.56-5 8z" />
+			{/* Median ray from cross-bar midpoint continuing to top-right */}
+			<path d="M12.5 14.5l7-9-.9-.56-7 9z" />
+			{/* Upper tine from top of cross-bar */}
+			<path d="M15 10l6-7-.85-.73-6 7z" />
+			{/* Lower tine from bottom of cross-bar */}
+			<path d="M10 19l6-7-.85-.73-6 7z" />
+			{/* Cross-bar connecting the two tine anchors */}
+			<path d="M9.6 19.7l6.8-10-.85-.56-6.8 10z" opacity=".4" />
+			{/* Pivot dot */}
+			<path d="M7.5 24c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+			{/* Upper tine anchor dot */}
+			<path d="M15 11.5c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+			{/* Lower tine anchor dot */}
+			<path d="M10 20.5c.828 0 1.5-.672 1.5-1.5s-.672-1.5-1.5-1.5-1.5.672-1.5 1.5.672 1.5 1.5 1.5zm0 1c-1.381 0-2.5-1.119-2.5-2.5s1.119-2.5 2.5-2.5 2.5 1.119 2.5 2.5-1.119 2.5-2.5 2.5z" />
+		</g>
+	</svg>
+);
+
 // Settings gear glyph.
 const GearIcon = () => (
 	<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
@@ -133,6 +164,7 @@ const TOOLS: { kind: LineKind; label: string; Icon: () => JSX.Element }[] = [
 	{ kind: 'vertical', label: 'Vertical Line', Icon: VerticalIcon },
 	{ kind: 'cross', label: 'Cross Line', Icon: CrossIcon },
 	{ kind: 'channel', label: 'Parallel Channel', Icon: ChannelIcon },
+	{ kind: 'pitchfork', label: 'Pitchfork', Icon: PitchforkIcon },
 ];
 
 export function DrawingToolbar({
@@ -142,6 +174,10 @@ export function DrawingToolbar({
 	onToggleLive,
 	candles,
 	onToggleCandles,
+	enabledMAs,
+	onToggleMA,
+	rsiEnabled,
+	onToggleRSI,
 }: DrawingToolbarProps) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
@@ -260,6 +296,38 @@ export function DrawingToolbar({
 						>
 							<span className={`tv-check${live ? ' tv-check-on' : ''}`} />
 							<span className="tv-menu-label">Live data feed</span>
+						</button>
+						<div className="tv-menu-title tv-menu-title-spaced">Moving Averages</div>
+						{MA_PRESETS.map(({ period, label, color }) => {
+							const on = enabledMAs.has(period);
+							return (
+								<button
+									key={period}
+									className="tv-menu-item"
+									role="menuitemcheckbox"
+									aria-checked={on}
+									onClick={() => onToggleMA(period)}
+								>
+									<span className={`tv-check${on ? ' tv-check-on' : ''}`}
+										style={on ? { background: color, borderColor: color } : undefined}
+									/>
+									<span className="tv-menu-label">{label}</span>
+									<span className="tv-ma-swatch" style={{ background: color }} />
+								</button>
+							);
+						})}
+						<div className="tv-menu-title tv-menu-title-spaced">Indicators</div>
+						<button
+							className="tv-menu-item"
+							role="menuitemcheckbox"
+							aria-checked={rsiEnabled}
+							onClick={onToggleRSI}
+						>
+							<span className={`tv-check${rsiEnabled ? ' tv-check-on' : ''}`}
+								style={rsiEnabled ? { background: '#f48fb1', borderColor: '#f48fb1' } : undefined}
+							/>
+							<span className="tv-menu-label">RSI (14)</span>
+							<span className="tv-ma-swatch" style={{ background: '#f48fb1' }} />
 						</button>
 					</div>
 				)}
@@ -398,6 +466,18 @@ const TOOLBAR_CSS = `
 	text-transform: uppercase;
 	letter-spacing: 0.04em;
 	color: #787b86;
+}
+
+/* Spaced second section title in the settings menu. */
+.tv-menu-title-spaced { margin-top: 6px; border-top: 1px solid #2a2e39; padding-top: 8px; }
+
+/* Coloured swatch dot showing the MA line colour. */
+.tv-ma-swatch {
+	width: 20px;
+	height: 3px;
+	border-radius: 2px;
+	margin-left: auto;
+	flex: none;
 }
 
 /* Checkmark toggle used in the settings menu. */

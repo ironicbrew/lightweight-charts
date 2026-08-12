@@ -10,6 +10,8 @@ import {
 	type Time,
 } from 'lightweight-charts';
 import { TrendLineDrawingTool, type LineKind } from './plugins/trend-line-tool';
+import { MovingAverageTool } from './plugins/moving-average-tool';
+import { RsiTool } from './plugins/rsi-tool';
 import { DrawingToolbar } from './DrawingToolbar';
 
 type SeriesKind = 'Line' | 'Candlestick';
@@ -64,6 +66,8 @@ export function Chart() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const chartRef = useRef<IChartApi | null>(null);
 	const toolRef = useRef<TrendLineDrawingTool | null>(null);
+	const maToolRef = useRef<MovingAverageTool | null>(null);
+	const rsiToolRef = useRef<RsiTool | null>(null);
 	const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Candlestick'> | null>(null);
 	// Canonical bars persist across type toggles so live appends aren't lost.
 	const barsRef = useRef<Bar[]>(makeSeedBars());
@@ -71,6 +75,9 @@ export function Chart() {
 	const [activeKind, setActiveKind] = useState<LineKind | null>(null);
 	const [live, setLive] = useState(false);
 	const [seriesType, setSeriesType] = useState<SeriesKind>('Line');
+	// Tracks which MA periods are currently enabled (for toolbar checkbox state).
+	const [enabledMAs, setEnabledMAs] = useState<Set<number>>(new Set());
+	const [rsiEnabled, setRsiEnabled] = useState(false);
 
 	// Build the chart + series + drawing tool. Rebuilds when the series type
 	// changes (swapping the series requires a fresh series object and tool).
@@ -121,12 +128,27 @@ export function Chart() {
 		tool.onStateChange((_drawing, kind) => setActiveKind(kind));
 		toolRef.current = tool;
 
+		const maTool = new MovingAverageTool(chart);
+		// Re-enable any MAs that were on before the series type toggle.
+		for (const period of enabledMAs) {
+			maTool.toggle(period, bars);
+		}
+		maToolRef.current = maTool;
+
+		const rsiTool = new RsiTool(chart);
+		if (rsiEnabled) rsiTool.enable(bars);
+		rsiToolRef.current = rsiTool;
+
 		return () => {
 			tool.remove();
+			maTool.remove();
+			rsiTool.remove();
 			chart.remove();
 			chartRef.current = null;
 			seriesRef.current = null;
 			toolRef.current = null;
+			maToolRef.current = null;
+			rsiToolRef.current = null;
 		};
 	}, [seriesType]);
 
@@ -145,9 +167,30 @@ export function Chart() {
 			} else {
 				(series as ISeriesApi<'Line'>).update(toLine(bar));
 			}
+			maToolRef.current?.appendBar(bars);
+			rsiToolRef.current?.appendBar(bars);
 		}, 1000);
 		return () => clearInterval(id);
 	}, [live, seriesType]);
+
+	const handleToggleRSI = () => {
+		const rsiTool = rsiToolRef.current;
+		if (!rsiTool) return;
+		const nowEnabled = rsiTool.toggle(barsRef.current);
+		setRsiEnabled(nowEnabled);
+	};
+
+	const handleToggleMA = (period: number) => {
+		const maTool = maToolRef.current;
+		if (!maTool) return;
+		const nowEnabled = maTool.toggle(period, barsRef.current);
+		setEnabledMAs(prev => {
+			const next = new Set(prev);
+			if (nowEnabled) next.add(period);
+			else next.delete(period);
+			return next;
+		});
+	};
 
 	return (
 		<div style={{ display: 'flex', width: '100%', height: '100%' }}>
@@ -158,6 +201,10 @@ export function Chart() {
 				onToggleLive={() => setLive(v => !v)}
 				candles={seriesType === 'Candlestick'}
 				onToggleCandles={() => setSeriesType(t => (t === 'Line' ? 'Candlestick' : 'Line'))}
+				enabledMAs={enabledMAs}
+				onToggleMA={handleToggleMA}
+				rsiEnabled={rsiEnabled}
+				onToggleRSI={handleToggleRSI}
 			/>
 			<div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
 				<div ref={containerRef} style={{ width: '100%', height: '100%' }} />

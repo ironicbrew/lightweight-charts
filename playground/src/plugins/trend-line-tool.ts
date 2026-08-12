@@ -49,7 +49,8 @@ export type LineKind =
 	| "horizontal-ray"
 	| "vertical"
 	| "cross"
-	| "channel";
+	| "channel"
+	| "pitchfork";
 
 export interface TrendLineOptions {
 	lineColor: string;
@@ -1193,6 +1194,260 @@ class PreviewParallelChannel extends ParallelChannel {
 	}
 }
 
+// ── Pitchfork (Andrews' Pitchfork): pivot p1, tine anchors p2 & p3 ─────────────
+// Median line: from p1 through midpoint(p2,p3), extending as a ray.
+// Upper tine: through p2, parallel to the median, extending as a ray.
+// Lower tine: through p3, parallel to the median, extending as a ray.
+// Three endpoint handles (one per anchor) + body hit-test over any tine.
+type PitchforkHandle = 0 | 1 | 2 | 3;
+
+class PitchforkPaneRenderer implements IPrimitivePaneRenderer {
+	constructor(
+		private _p1: ViewPoint,
+		private _p2: ViewPoint,
+		private _p3: ViewPoint,
+		private _mid: ViewPoint,
+		private _color: string,
+		private _width: number,
+		private _handleRadius: number,
+		private _hovered: PitchforkHandle,
+		private _showHandles: boolean,
+	) {}
+
+	draw(target: CanvasRenderingTarget2D) {
+		target.useBitmapCoordinateSpace((scope: BitmapCoordinatesRenderingScope) => {
+			const { _p1: p1, _p2: p2, _p3: p3, _mid: mid } = this;
+			if (
+				p1.x === null || p1.y === null ||
+				p2.x === null || p2.y === null ||
+				p3.x === null || p3.y === null ||
+				mid.x === null || mid.y === null
+			) return;
+
+			const ctx = scope.context;
+			const hr = scope.horizontalPixelRatio;
+			const vr = scope.verticalPixelRatio;
+			const w = scope.bitmapSize.width;
+			const h = scope.bitmapSize.height;
+
+			const sx = (v: ViewPoint) => (v.x as number) * hr;
+			const sy = (v: ViewPoint) => (v.y as number) * vr;
+
+			// Direction vector of the median (p1 → midpoint(p2,p3))
+			const dx = sx(mid) - sx(p1);
+			const dy = sy(mid) - sy(p1);
+
+			// Extend each tine from its anchor in the median direction to canvas edge.
+			const [ex2, ey2] = extendToEdge(sx(p2), sy(p2), sx(p2) + dx, sy(p2) + dy, w, h);
+			const [ex3, ey3] = extendToEdge(sx(p3), sy(p3), sx(p3) + dx, sy(p3) + dy, w, h);
+			const [exm, eym] = extendToEdge(sx(p1), sy(p1), sx(mid), sy(mid), w, h);
+
+			ctx.lineWidth = this._width;
+			ctx.strokeStyle = this._color;
+
+			// Handle shaft: p1 to midpoint(p2,p3).
+			ctx.beginPath();
+			ctx.moveTo(sx(p1), sy(p1));
+			ctx.lineTo(sx(mid), sy(mid));
+			ctx.stroke();
+
+			// Median ray: from midpoint onward.
+			ctx.setLineDash([]);
+			ctx.beginPath();
+			ctx.moveTo(sx(mid), sy(mid));
+			ctx.lineTo(exm, eym);
+			ctx.stroke();
+
+			// Upper & lower tines from anchors outward.
+			ctx.beginPath();
+			ctx.moveTo(sx(p2), sy(p2));
+			ctx.lineTo(ex2, ey2);
+			ctx.moveTo(sx(p3), sy(p3));
+			ctx.lineTo(ex3, ey3);
+			ctx.stroke();
+
+			// Cross-bar connecting p2 to p3.
+			ctx.save();
+			ctx.setLineDash([3 * hr, 3 * hr]);
+			ctx.lineWidth = Math.max(1, this._width - 1);
+			ctx.beginPath();
+			ctx.moveTo(sx(p2), sy(p2));
+			ctx.lineTo(sx(p3), sy(p3));
+			ctx.stroke();
+			ctx.restore();
+
+			if (!this._showHandles) return;
+			this._handle(ctx, sx(p1), sy(p1), hr, this._hovered === 1);
+			this._handle(ctx, sx(p2), sy(p2), hr, this._hovered === 2);
+			this._handle(ctx, sx(p3), sy(p3), hr, this._hovered === 3);
+		});
+	}
+
+	private _handle(
+		ctx: CanvasRenderingContext2D,
+		x: number,
+		y: number,
+		ratio: number,
+		hovered: boolean,
+	) {
+		const r = (hovered ? this._handleRadius + 2 : this._handleRadius) * ratio;
+		ctx.beginPath();
+		ctx.arc(x, y, r, 0, 2 * Math.PI);
+		ctx.fillStyle = "#111317";
+		ctx.fill();
+		ctx.lineWidth = 2 * ratio;
+		ctx.strokeStyle = this._color;
+		ctx.stroke();
+	}
+}
+
+class PitchforkPaneView implements UpdatablePaneView {
+	private _p1: ViewPoint = { x: null, y: null };
+	private _p2: ViewPoint = { x: null, y: null };
+	private _p3: ViewPoint = { x: null, y: null };
+	private _mid: ViewPoint = { x: null, y: null };
+
+	constructor(private _source: Pitchfork) {}
+
+	update() {
+		const s = this._source;
+		this._p1 = s.coordOf(s._p1);
+		this._p2 = s.coordOf(s._p2);
+		this._p3 = s.coordOf(s._p3);
+		// Midpoint of p2/p3 computed in pixel space (fractional logical → no coord).
+		this._mid = midpoint(this._p2, this._p3);
+	}
+
+	renderer() {
+		return new PitchforkPaneRenderer(
+			this._p1,
+			this._p2,
+			this._p3,
+			this._mid,
+			this._source._options.lineColor,
+			this._source._options.width,
+			this._source._options.handleRadius,
+			this._source.hoveredHandle,
+			this._source.showHandles,
+		);
+	}
+}
+
+export class Pitchfork extends DrawingPrimitive {
+	public hoveredHandle: PitchforkHandle = 0;
+	public showHandles = true;
+
+	constructor(
+		public _p1: Point,
+		public _p2: Point,
+		public _p3: Point,
+		options: Partial<TrendLineOptions> = {},
+	) {
+		super(options);
+		this._views = [new PitchforkPaneView(this)];
+	}
+
+	setPoint(which: PitchforkHandle, p: Point) {
+		if (which === 1) this._p1 = p;
+		else if (which === 2) this._p2 = p;
+		else if (which === 3) this._p3 = p;
+		this.updateAllViews();
+		this.requestUpdate();
+	}
+
+	hitTestHandle(x: number, y: number): PitchforkHandle {
+		for (const [i, pt] of [[1, this._p1], [2, this._p2], [3, this._p3]] as [PitchforkHandle, Point][]) {
+			const c = this.coordOf(pt);
+			if (c.x === null || c.y === null) continue;
+			if (Math.hypot(c.x - x, c.y - y) <= HIT_RADIUS) return i;
+		}
+		return 0;
+	}
+
+	hitTestBody(x: number, y: number): boolean {
+		const c1 = this.coordOf(this._p1);
+		const c2 = this.coordOf(this._p2);
+		const c3 = this.coordOf(this._p3);
+		if (c1.x === null || c1.y === null || c2.x === null || c2.y === null || c3.x === null || c3.y === null) {
+			return false;
+		}
+
+		// The median direction vector (toward midpoint of p2/p3).
+		const mid = midpoint(c2, c3);
+		if (mid.x === null || mid.y === null) return false;
+		const dx = mid.x - c1.x;
+		const dy = mid.y - c1.y;
+
+		// Check each of the three ray segments: shaft, upper tine, lower tine.
+		const nearRay = (ox: number, oy: number) => {
+			const lenSq = dx * dx + dy * dy;
+			if (lenSq === 0) return false;
+			const t = Math.max(0, ((x - ox) * dx + (y - oy) * dy) / lenSq);
+			return Math.hypot(x - (ox + t * dx), y - (oy + t * dy)) <= BODY_HIT_RADIUS;
+		};
+
+		// Shaft: p1 to mid (clamped segment, not a ray).
+		const shaftLenSq = dx * dx + dy * dy;
+		if (shaftLenSq > 0) {
+			const t = Math.max(0, Math.min(1, ((x - c1.x) * dx + (y - c1.y) * dy) / shaftLenSq));
+			if (Math.hypot(x - (c1.x + t * dx), y - (c1.y + t * dy)) <= BODY_HIT_RADIUS) return true;
+		}
+
+		return nearRay(c2.x, c2.y) || nearRay(c3.x, c3.y);
+	}
+
+	beginDrag(x: number, y: number): Dragger | null {
+		const which = this.hitTestHandle(x, y);
+		if (which !== 0) {
+			return snapDragger(this, (p) => this.setPoint(which, p));
+		}
+		if (this.hitTestBody(x, y)) {
+			const tracker = new BarTracker(this.chart.timeScale(), x);
+			let lastY = y;
+			return {
+				move: (mx, my) => {
+					const dyp = my - lastY;
+					lastY = my;
+					const bars = tracker.step(mx);
+					for (const w of [1, 2, 3] as PitchforkHandle[]) {
+						const cur = w === 1 ? this._p1 : w === 2 ? this._p2 : this._p3;
+						const c = this.coordOf(cur);
+						if (c.x === null || c.y === null) continue;
+						const np = this.series.coordinateToPrice((c.y as number) + dyp);
+						const next = { ...cur };
+						if (np !== null) next.price = np;
+						if (bars !== 0) next.logical = cur.logical + bars;
+						this.setPoint(w, next);
+					}
+				},
+			};
+		}
+		return null;
+	}
+
+	updateHover(x: number, y: number): boolean {
+		const which = this.hitTestHandle(x, y);
+		if (which !== this.hoveredHandle) {
+			this.hoveredHandle = which;
+			this.requestUpdate();
+		}
+		return which !== 0 || this.hitTestBody(x, y);
+	}
+}
+
+// Preview pitchfork used during placement (click 1: shaft preview, click 2: full preview).
+class PreviewPitchfork extends Pitchfork {
+	constructor(p1: Point, p2: Point, p3: Point, options: Partial<TrendLineOptions> = {}) {
+		super(p1, p2, p3, options);
+		this._options.lineColor = this._options.previewColor;
+		this.showHandles = false;
+	}
+
+	updatePoint(which: PitchforkHandle, p: Point) {
+		this.setPoint(which, p);
+	}
+}
+
 // ── Tool registry: per-kind placement (clicks + build + preview) ──────────────
 interface ToolSpec {
 	clicks: number;
@@ -1239,6 +1494,22 @@ const TOOLS: Record<LineKind, ToolSpec> = {
 		previewCursor: (prev, cur) => {
 			if (prev instanceof PreviewParallelChannel) {
 				prev.setOffsetFromPoint(cur.logical, cur.price);
+			} else {
+				(prev as PreviewTrendLine).updateEndPoint(cur);
+			}
+		},
+	},
+	pitchfork: {
+		clicks: 3,
+		build: (pts, o) => new Pitchfork(pts[0], pts[1], pts[2], o),
+		// Stage 1: shaft preview (p1 → cursor); stage 2: full pitchfork preview.
+		preview: (pts, o) =>
+			pts.length === 1
+				? new PreviewTrendLine(pts[0], pts[0], o)
+				: new PreviewPitchfork(pts[0], pts[1], pts[1], o),
+		previewCursor: (prev, cur) => {
+			if (prev instanceof PreviewPitchfork) {
+				prev.updatePoint(3, cur);
 			} else {
 				(prev as PreviewTrendLine).updateEndPoint(cur);
 			}
