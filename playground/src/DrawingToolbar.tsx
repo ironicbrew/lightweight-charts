@@ -23,6 +23,8 @@ interface DrawingToolbarProps {
 	onToggleMA: (period: number) => void;
 	rsiEnabled: boolean;
 	onToggleRSI: () => void;
+	macdEnabled: boolean;
+	onToggleMACD: () => void;
 }
 
 // TradingView's trendline glyph (diagonal line + two ringed endpoints).
@@ -178,6 +180,8 @@ export function DrawingToolbar({
 	onToggleMA,
 	rsiEnabled,
 	onToggleRSI,
+	macdEnabled,
+	onToggleMACD,
 }: DrawingToolbarProps) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
@@ -328,6 +332,18 @@ export function DrawingToolbar({
 							/>
 							<span className="tv-menu-label">RSI (14)</span>
 							<span className="tv-ma-swatch" style={{ background: '#f48fb1' }} />
+						</button>
+						<button
+							className="tv-menu-item"
+							role="menuitemcheckbox"
+							aria-checked={macdEnabled}
+							onClick={onToggleMACD}
+						>
+							<span className={`tv-check${macdEnabled ? ' tv-check-on' : ''}`}
+								style={macdEnabled ? { background: '#2962FF', borderColor: '#2962FF' } : undefined}
+							/>
+							<span className="tv-menu-label">MACD (12,26,9)</span>
+							<span className="tv-ma-swatch" style={{ background: '#2962FF' }} />
 						</button>
 					</div>
 				)}

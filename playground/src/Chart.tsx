@@ -12,6 +12,7 @@ import {
 import { TrendLineDrawingTool, type LineKind } from './plugins/trend-line-tool';
 import { MovingAverageTool } from './plugins/moving-average-tool';
 import { RsiTool } from './plugins/rsi-tool';
+import { MacdTool } from './plugins/macd-tool';
 import { DrawingToolbar } from './DrawingToolbar';
 
 type SeriesKind = 'Line' | 'Candlestick';
@@ -68,6 +69,7 @@ export function Chart() {
 	const toolRef = useRef<TrendLineDrawingTool | null>(null);
 	const maToolRef = useRef<MovingAverageTool | null>(null);
 	const rsiToolRef = useRef<RsiTool | null>(null);
+	const macdToolRef = useRef<MacdTool | null>(null);
 	const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Candlestick'> | null>(null);
 	// Canonical bars persist across type toggles so live appends aren't lost.
 	const barsRef = useRef<Bar[]>(makeSeedBars());
@@ -78,6 +80,7 @@ export function Chart() {
 	// Tracks which MA periods are currently enabled (for toolbar checkbox state).
 	const [enabledMAs, setEnabledMAs] = useState<Set<number>>(new Set());
 	const [rsiEnabled, setRsiEnabled] = useState(false);
+	const [macdEnabled, setMacdEnabled] = useState(false);
 
 	// Build the chart + series + drawing tool. Rebuilds when the series type
 	// changes (swapping the series requires a fresh series object and tool).
@@ -139,16 +142,22 @@ export function Chart() {
 		if (rsiEnabled) rsiTool.enable(bars);
 		rsiToolRef.current = rsiTool;
 
+		const macdTool = new MacdTool(chart);
+		if (macdEnabled) macdTool.enable(bars);
+		macdToolRef.current = macdTool;
+
 		return () => {
 			tool.remove();
 			maTool.remove();
 			rsiTool.remove();
+			macdTool.remove();
 			chart.remove();
 			chartRef.current = null;
 			seriesRef.current = null;
 			toolRef.current = null;
 			maToolRef.current = null;
 			rsiToolRef.current = null;
+			macdToolRef.current = null;
 		};
 	}, [seriesType]);
 
@@ -169,6 +178,7 @@ export function Chart() {
 			}
 			maToolRef.current?.appendBar(bars);
 			rsiToolRef.current?.appendBar(bars);
+			macdToolRef.current?.appendBar(bars);
 		}, 1000);
 		return () => clearInterval(id);
 	}, [live, seriesType]);
@@ -178,6 +188,13 @@ export function Chart() {
 		if (!rsiTool) return;
 		const nowEnabled = rsiTool.toggle(barsRef.current);
 		setRsiEnabled(nowEnabled);
+	};
+
+	const handleToggleMACD = () => {
+		const macdTool = macdToolRef.current;
+		if (!macdTool) return;
+		const nowEnabled = macdTool.toggle(barsRef.current);
+		setMacdEnabled(nowEnabled);
 	};
 
 	const handleToggleMA = (period: number) => {
@@ -205,6 +222,8 @@ export function Chart() {
 				onToggleMA={handleToggleMA}
 				rsiEnabled={rsiEnabled}
 				onToggleRSI={handleToggleRSI}
+				macdEnabled={macdEnabled}
+				onToggleMACD={handleToggleMACD}
 			/>
 			<div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
 				<div ref={containerRef} style={{ width: '100%', height: '100%' }} />
